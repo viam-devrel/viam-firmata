@@ -141,3 +141,26 @@ func (c *Client) EnableDigitalReporting(port int, enable bool) error {
 	}
 	return c.writeFrame(encodeReportDigital(uint8(port), enable))
 }
+
+// DigitalWrite sets a single pin HIGH or LOW. It read-modify-writes the cached
+// output mask for the pin's port, so multiple pins on the same port coexist.
+func (c *Client) DigitalWrite(pin int, high bool) error {
+	if pin < 0 || pin > 127 {
+		return fmt.Errorf("pin %d out of range", pin)
+	}
+	port := uint8(pin / 8)
+	bit := uint8(pin % 8)
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if errp := c.readErr.Load(); errp != nil {
+		return fmt.Errorf("firmata: stream closed: %w", *errp)
+	}
+	if high {
+		c.outState[port] |= 1 << bit
+	} else {
+		c.outState[port] &^= 1 << bit
+	}
+	_, err := c.rw.Write(encodeDigitalPortWrite(port, c.outState[port]))
+	return err
+}

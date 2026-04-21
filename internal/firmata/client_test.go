@@ -127,3 +127,31 @@ func TestEnableDigitalReportingWritesBytes(t *testing.T) {
 		t.Errorf("got % X, want % X", got, want)
 	}
 }
+
+func TestDigitalWriteTracksPortMask(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	// Drive pin 13 HIGH. pin 13 = port 1, bit 5 -> mask 0x20.
+	// Expected frame: 0x91 0x20 0x00
+	go func() { _ = c.DigitalWrite(13, true) }()
+	got := readN(t, pp.board, 3)
+	if want := []byte{0x91, 0x20, 0x00}; !bytes.Equal(got, want) {
+		t.Fatalf("first write: got % X, want % X", got, want)
+	}
+
+	// Drive pin 12 HIGH (same port, bit 4). Mask must now be 0x30.
+	go func() { _ = c.DigitalWrite(12, true) }()
+	got = readN(t, pp.board, 3)
+	if want := []byte{0x91, 0x30, 0x00}; !bytes.Equal(got, want) {
+		t.Fatalf("second write: got % X, want % X", got, want)
+	}
+
+	// Drive pin 13 LOW again — mask goes back to 0x10.
+	go func() { _ = c.DigitalWrite(13, false) }()
+	got = readN(t, pp.board, 3)
+	if want := []byte{0x91, 0x10, 0x00}; !bytes.Equal(got, want) {
+		t.Fatalf("third write: got % X, want % X", got, want)
+	}
+}
