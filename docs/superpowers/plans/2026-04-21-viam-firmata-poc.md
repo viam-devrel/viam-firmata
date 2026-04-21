@@ -333,15 +333,20 @@ Expected: compile error — `undefined: decode`, `undefined: VersionMessage`, `u
 
 - [ ] **Step 3: Implement decode in `protocol.go`**
 
-Append to `internal/firmata/protocol.go`:
+Replace the top of `internal/firmata/protocol.go` so the `package` clause is immediately followed by this single import block:
 
 ```go
+package firmata
+
 import (
 	"bufio"
 	"fmt"
-	"io"
 )
+```
 
+Then **append** everything below to the rest of the file (after the existing constants and encode functions from Task 2):
+
+```go
 // Message is a decoded Firmata frame. Concrete types below.
 type Message interface{ isMessage() }
 
@@ -443,11 +448,9 @@ func readUntilEndSysex(r *bufio.Reader) ([]byte, error) {
 	}
 }
 
-// io is reserved for client.go; silence the unused import if the linter complains.
-var _ io.Reader = (*bufio.Reader)(nil)
 ```
 
-Note: the `import` block above must be merged with the existing top-of-file imports, not a second block. The stub `var _ io.Reader` line exists only so that `io` is tracked as a used package once `client.go` lands; delete it after `client.go` is written if `goimports` complains.
+Note: the `io` package is imported later by `client.go`, not by `protocol.go`, so no `io` import belongs here.
 
 - [ ] **Step 4: Run the tests and verify they pass**
 
@@ -669,14 +672,10 @@ go test ./internal/firmata/... -v -run TestClientCloseStopsReader
 
 Expected: PASS within 1s.
 
-- [ ] **Step 5: Remove the temporary `var _ io.Reader` line from `protocol.go`**
-
-Now that `client.go` uses `io`, delete the stub from the end of `protocol.go`. Re-run `go test ./...` — still green.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add internal/firmata/client.go internal/firmata/client_test.go internal/firmata/protocol.go
+git add internal/firmata/client.go internal/firmata/client_test.go
 git commit -m "feat(firmata): add Client skeleton with reader goroutine and Close"
 ```
 
@@ -923,37 +922,11 @@ Expected: `undefined: DigitalWrite`.
 
 - [ ] **Step 3: Implement DigitalWrite**
 
-Append to `client.go`:
+Append to `client.go`. Note: we do NOT call `writeFrame` here because `writeFrame` also takes `writeMu` — nesting would deadlock. Instead, we hold `writeMu` across both the state update and the raw `rw.Write`, which is also the atomicity we want (another goroutine can't interleave a conflicting port write between the read-modify and the send).
 
 ```go
 // DigitalWrite sets a single pin HIGH or LOW. It read-modify-writes the cached
 // output mask for the pin's port, so multiple pins on the same port coexist.
-func (c *Client) DigitalWrite(pin int, high bool) error {
-	if pin < 0 || pin > 127 {
-		return fmt.Errorf("pin %d out of range", pin)
-	}
-	port := uint8(pin / 8)
-	bit := uint8(pin % 8)
-
-	c.writeMu.Lock()
-	mask := c.outState[port]
-	if high {
-		mask |= 1 << bit
-	} else {
-		mask &^= 1 << bit
-	}
-	c.outState[port] = mask
-	c.writeMu.Unlock()
-
-	return c.writeFrame(encodeDigitalPortWrite(port, mask))
-}
-```
-
-(Note: we hold `writeMu` briefly to read-modify the state array, then release it so `writeFrame` can take it again for the actual write. An alternative is a separate `stateMu`; for this PoC we keep one mutex.)
-
-Actually, simpler — `writeFrame` already takes `writeMu`. Nesting is a deadlock. Restructure `DigitalWrite` to inline the write under a single lock acquisition:
-
-```go
 func (c *Client) DigitalWrite(pin int, high bool) error {
 	if pin < 0 || pin > 127 {
 		return fmt.Errorf("pin %d out of range", pin)
@@ -975,8 +948,6 @@ func (c *Client) DigitalWrite(pin int, high bool) error {
 	return err
 }
 ```
-
-Use this second form. Remove any lingering version of the first.
 
 - [ ] **Step 4: Run and confirm passing**
 
