@@ -88,12 +88,17 @@ type PinChange struct {
     High bool
 }
 
+type VersionMessage struct {
+    Major, Minor uint8
+}
+
 type Client struct {
     rw         io.ReadWriteCloser
-    portState  [16]uint8          // last-known mask per port, for diffing
-    reported   [16]uint8          // which pins are we reporting on (for diffing)
+    portState  [16]uint8          // last-known input mask per port, for diffing
+    outState   [16]uint8          // last-written output mask per port
     events     chan PinChange
-    version    chan struct{ Major, Minor uint8 }
+    version    chan VersionMessage
+    readErr    atomic.Pointer[error] // last reader-goroutine error, surfaced by next write
     readerDone chan struct{}
     writeMu    sync.Mutex
 }
@@ -102,7 +107,7 @@ func New(rw io.ReadWriteCloser) *Client
 func (c *Client) Handshake(ctx context.Context) (major, minor uint8, err error)
 func (c *Client) SetPinMode(pin int, mode PinMode) error
 func (c *Client) DigitalWrite(pin int, high bool) error
-func (c *Client) EnableDigitalReporting(port int, enable bool) error
+func (c *Client) EnableDigitalReporting(port int, enable bool) error // port is a PORT INDEX (pin/8), not a pin number
 func (c *Client) Events() <-chan PinChange
 func (c *Client) Close() error
 ```
@@ -133,7 +138,7 @@ CLI flags:
 Execution sequence:
 1. Parse flags; fail fast if `-port` is empty.
 2. Open the serial port via `go.bug.st/serial.Open` with the given baud, 8N1.
-3. Toggle DTR to trigger the Arduino auto-reset, then sleep 2s.
+3. Toggle DTR to trigger the Arduino auto-reset, then sleep 2s. (The 2s delay is an intentionally hardcoded constant — the Arduino bootloader's ~1.6s window is well-characterized and there is no reason to expose it as a flag for this PoC.)
 4. `client := firmata.New(port)`; `client.Handshake(ctx5s)`; log `firmware version M.m`.
 5. `SetPinMode(outPin, OUTPUT)`; `SetPinMode(inPin, INPUT_PULLUP)`; `EnableDigitalReporting(inPin/8, true)`.
 6. Start a `time.Ticker(toggleInterval)` that flips an `outHigh` bool and calls `DigitalWrite`.
@@ -165,7 +170,7 @@ Execution sequence:
 ## 6. Error handling
 
 - **Wrong port / not Firmata:** `Handshake` blocks until either a version frame arrives or ctx expires; on timeout it returns an error wrapping the port path and a hint about `-baud` / wrong device.
-- **Serial read errors:** reader goroutine exits, closes `events`. Next client write returns the error via the shared error field; main logs and exits non-zero.
+- **Serial read errors:** reader goroutine exits, closes `events`, and stores the error in `Client.readErr`. The next call to any write-side method returns that error to the caller; main logs and exits non-zero.
 - **Malformed frames:** resync policy above. Never fatal.
 - **Short writes:** treated as errors from the caller's perspective; serial library is expected to return `n, err` semantics per `io.Writer`.
 - **Context cancellation in main:** `Close()` is idempotent; the ticker and events loop both exit on channel close.
