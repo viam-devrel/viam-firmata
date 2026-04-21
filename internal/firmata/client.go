@@ -2,6 +2,7 @@ package firmata
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -94,6 +95,22 @@ func (c *Client) dispatchDigital(m DigitalPortMessage) {
 		}
 	}
 	c.portState[m.Port] = m.Mask
+}
+
+// Handshake blocks until the firmware sends a REPORT_VERSION frame or ctx expires.
+// It also proactively sends a REPORT_VERSION query, because some firmwares only
+// send the version on request (not on reset).
+func (c *Client) Handshake(ctx context.Context) (major, minor uint8, err error) {
+	// Ask, in case the auto-emit was missed or the firmware doesn't send one on reset.
+	// Send in a goroutine: io.Pipe (used in tests) blocks the write until the other end
+	// reads, so we must not block the select on the outbound query.
+	go func() { _ = c.writeFrame([]byte{cmdReportVersion}) }()
+	select {
+	case v := <-c.version:
+		return v.Major, v.Minor, nil
+	case <-ctx.Done():
+		return 0, 0, fmt.Errorf("handshake: %w (no REPORT_VERSION received — wrong port or baud?)", ctx.Err())
+	}
 }
 
 // writeFrame sends an already-encoded frame, honoring writeMu and surfacing

@@ -1,6 +1,7 @@
 package firmata
 
 import (
+	"context"
 	"io"
 	"testing"
 	"time"
@@ -52,5 +53,39 @@ func TestClientCloseStopsReader(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("reader goroutine did not exit within 1s")
+	}
+}
+
+func TestHandshakeSucceeds(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	// Fake board sends a REPORT_VERSION 2.5 frame.
+	go func() {
+		_, _ = pp.board.Write([]byte{0xF9, 0x02, 0x05})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	major, minor, err := c.Handshake(ctx)
+	if err != nil {
+		t.Fatalf("Handshake: %v", err)
+	}
+	if major != 2 || minor != 5 {
+		t.Errorf("got %d.%d, want 2.5", major, minor)
+	}
+}
+
+func TestHandshakeTimesOut(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, _, err := c.Handshake(ctx)
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
 	}
 }
