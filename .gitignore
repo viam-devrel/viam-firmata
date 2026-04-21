@@ -1,0 +1,6 @@
+# Per-developer Go workspace file. Contents are environment-specific.
+go.work
+go.work.sum
+
+# Binary output of `go build`
+/firmata-poc
