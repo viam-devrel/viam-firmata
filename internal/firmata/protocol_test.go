@@ -143,3 +143,17 @@ func TestDecode_ResyncOnLeadingNoise(t *testing.T) {
 		t.Fatalf("wanted VersionMessage after resync, got %T", msg)
 	}
 }
+
+func TestDecode_SysexOverflowErrors(t *testing.T) {
+	// A sysex frame with no END_SYSEX byte and more than maxSysexPayload
+	// payload bytes must fail with an error rather than allocating unboundedly.
+	buf := make([]byte, 0, maxSysexPayload+8)
+	buf = append(buf, cmdStartSysex)
+	for range maxSysexPayload + 1 {
+		buf = append(buf, 0x00)
+	}
+	_, err := decode(bufio.NewReader(bytes.NewReader(buf)))
+	if err == nil {
+		t.Fatal("expected error for unbounded sysex, got nil")
+	}
+}

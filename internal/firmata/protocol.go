@@ -146,8 +146,13 @@ func decode(r *bufio.Reader) (Message, error) {
 	}
 }
 
+// maxSysexPayload bounds sysex reads so a firmware that never sends END_SYSEX
+// (or a bit-stream that looks like an endless sysex frame) can't exhaust memory.
+// 4096 bytes is well above any realistic ConfigurableFirmata sysex payload.
+const maxSysexPayload = 4096
+
 func readUntilEndSysex(r *bufio.Reader) ([]byte, error) {
-	var out []byte
+	out := make([]byte, 0, 32)
 	for {
 		b, err := r.ReadByte()
 		if err != nil {
@@ -155,6 +160,9 @@ func readUntilEndSysex(r *bufio.Reader) ([]byte, error) {
 		}
 		if b == cmdEndSysex {
 			return out, nil
+		}
+		if len(out) >= maxSysexPayload {
+			return nil, fmt.Errorf("sysex payload exceeds %d bytes without END_SYSEX", maxSysexPayload)
 		}
 		out = append(out, b)
 	}
