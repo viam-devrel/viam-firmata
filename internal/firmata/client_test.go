@@ -155,3 +155,53 @@ func TestDigitalWriteTracksPortMask(t *testing.T) {
 		t.Fatalf("third write: got % X, want % X", got, want)
 	}
 }
+
+func TestEventsEmittedPerChangedBit(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	// Board reports port 0 mask 0x05 (pins 0 and 2 high). Starting mask is 0
+	// so both pin 0 and pin 2 should emit a HIGH event.
+	_, _ = pp.board.Write([]byte{0x90, 0x05, 0x00})
+
+	got := collect(t, c.Events(), 2, time.Second)
+	wantSet := map[PinChange]bool{
+		{Pin: 0, High: true}: true,
+		{Pin: 2, High: true}: true,
+	}
+	for _, ev := range got {
+		if !wantSet[ev] {
+			t.Errorf("unexpected event %+v", ev)
+		}
+		delete(wantSet, ev)
+	}
+	if len(wantSet) != 0 {
+		t.Errorf("missing events: %+v", wantSet)
+	}
+
+	// Now board reports mask 0x01 — pin 2 went LOW, pin 0 unchanged.
+	_, _ = pp.board.Write([]byte{0x90, 0x01, 0x00})
+	got = collect(t, c.Events(), 1, time.Second)
+	if len(got) != 1 || got[0] != (PinChange{Pin: 2, High: false}) {
+		t.Errorf("got %+v, want [{Pin:2 High:false}]", got)
+	}
+}
+
+func collect(t *testing.T, ch <-chan PinChange, n int, timeout time.Duration) []PinChange {
+	t.Helper()
+	deadline := time.After(timeout)
+	out := make([]PinChange, 0, n)
+	for len(out) < n {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				t.Fatalf("events channel closed after %d of %d events", len(out), n)
+			}
+			out = append(out, ev)
+		case <-deadline:
+			t.Fatalf("timed out waiting for events; got %d of %d: %+v", len(out), n, out)
+		}
+	}
+	return out
+}
