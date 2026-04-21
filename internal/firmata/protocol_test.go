@@ -1,6 +1,7 @@
 package firmata
 
 import (
+	"bufio"
 	"bytes"
 	"testing"
 )
@@ -61,5 +62,84 @@ func TestEncode(t *testing.T) {
 				t.Errorf("got % X, want % X", tc.got, tc.want)
 			}
 		})
+	}
+}
+
+func TestDecode_Version(t *testing.T) {
+	// REPORT_VERSION (0xF9) major=2 minor=5
+	r := bufio.NewReader(bytes.NewReader([]byte{0xF9, 0x02, 0x05}))
+	msg, err := decode(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	v, ok := msg.(VersionMessage)
+	if !ok {
+		t.Fatalf("wanted VersionMessage, got %T", msg)
+	}
+	if v.Major != 2 || v.Minor != 5 {
+		t.Errorf("got %d.%d, want 2.5", v.Major, v.Minor)
+	}
+}
+
+func TestDecode_DigitalPort(t *testing.T) {
+	// DIGITAL_MESSAGE port 1, mask 0x20 -> bytes 0x91, 0x20, 0x00
+	r := bufio.NewReader(bytes.NewReader([]byte{0x91, 0x20, 0x00}))
+	msg, err := decode(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	d, ok := msg.(DigitalPortMessage)
+	if !ok {
+		t.Fatalf("wanted DigitalPortMessage, got %T", msg)
+	}
+	if d.Port != 1 || d.Mask != 0x20 {
+		t.Errorf("got port=%d mask=%#x, want port=1 mask=0x20", d.Port, d.Mask)
+	}
+}
+
+func TestDecode_DigitalPort_Bit7Split(t *testing.T) {
+	// mask 0x80 is split: lsb=0x00, msb=0x01.
+	r := bufio.NewReader(bytes.NewReader([]byte{0x90, 0x00, 0x01}))
+	msg, err := decode(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	d := msg.(DigitalPortMessage)
+	if d.Mask != 0x80 {
+		t.Errorf("got mask=%#x, want 0x80", d.Mask)
+	}
+}
+
+func TestDecode_SysexIsSkipped(t *testing.T) {
+	// A sysex frame: 0xF0 ... 0xF7, then a real version message.
+	r := bufio.NewReader(bytes.NewReader([]byte{0xF0, 0x79, 0x02, 0x05, 0xF7, 0xF9, 0x02, 0x05}))
+	// First decode call consumes the sysex as UnknownMessage.
+	first, err := decode(r)
+	if err != nil {
+		t.Fatalf("unexpected error decoding sysex: %v", err)
+	}
+	if _, ok := first.(UnknownMessage); !ok {
+		t.Fatalf("wanted UnknownMessage for sysex, got %T", first)
+	}
+	// Second decode call must find the real version frame.
+	second, err := decode(r)
+	if err != nil {
+		t.Fatalf("unexpected error after sysex: %v", err)
+	}
+	if _, ok := second.(VersionMessage); !ok {
+		t.Fatalf("wanted VersionMessage after sysex, got %T", second)
+	}
+}
+
+func TestDecode_ResyncOnLeadingNoise(t *testing.T) {
+	// Stray data bytes (bit 7 clear) followed by a valid version frame.
+	// Decoder should discard noise bytes until it finds a command byte.
+	r := bufio.NewReader(bytes.NewReader([]byte{0x00, 0x7F, 0x42, 0xF9, 0x02, 0x05}))
+	msg, err := decode(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := msg.(VersionMessage); !ok {
+		t.Fatalf("wanted VersionMessage after resync, got %T", msg)
 	}
 }

@@ -3,6 +3,11 @@
 // It is pure Go against io.ReadWriteCloser and has no serial-port dependency.
 package firmata
 
+import (
+	"bufio"
+	"fmt"
+)
+
 // Command bytes (bit 7 set). See https://github.com/firmata/protocol/blob/master/protocol.md
 const (
 	cmdDigitalMessage uint8 = 0x90 // low nibble = port index
@@ -49,4 +54,108 @@ func encodeReportDigital(port uint8, enable bool) []byte {
 		b = 1
 	}
 	return []byte{cmdReportDigital | (port & 0x0F), b}
+}
+
+// Message is a decoded Firmata frame. Concrete types below.
+type Message interface{ isMessage() }
+
+type VersionMessage struct {
+	Major, Minor uint8
+}
+
+func (VersionMessage) isMessage() {}
+
+type DigitalPortMessage struct {
+	Port uint8 // 0..15
+	Mask uint8 // bit n = pin (port*8 + n)
+}
+
+func (DigitalPortMessage) isMessage() {}
+
+// UnknownMessage is returned for any command we don't explicitly handle,
+// including sysex. Callers can ignore it.
+type UnknownMessage struct {
+	Cmd     uint8
+	Payload []byte
+}
+
+func (UnknownMessage) isMessage() {}
+
+// decode reads one complete Firmata frame. It resyncs on leading data bytes
+// (bit 7 clear) by discarding them until a command byte appears.
+func decode(r *bufio.Reader) (Message, error) {
+	// Resync: skip bytes until we see one with bit 7 set.
+	var cmd byte
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		if b&0x80 != 0 {
+			cmd = b
+			break
+		}
+	}
+
+	switch {
+	case cmd == cmdReportVersion:
+		major, err := r.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read version major: %w", err)
+		}
+		minor, err := r.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read version minor: %w", err)
+		}
+		return VersionMessage{Major: major, Minor: minor}, nil
+
+	case cmd&0xF0 == cmdDigitalMessage:
+		lsb, err := r.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read digital lsb: %w", err)
+		}
+		msb, err := r.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read digital msb: %w", err)
+		}
+		mask := (lsb & 0x7F) | ((msb & 0x01) << 7)
+		return DigitalPortMessage{Port: cmd & 0x0F, Mask: mask}, nil
+
+	case cmd == cmdStartSysex:
+		// Consume until END_SYSEX. First byte after 0xF0 is the sysex command id.
+		payload, err := readUntilEndSysex(r)
+		if err != nil {
+			return nil, fmt.Errorf("read sysex: %w", err)
+		}
+		return UnknownMessage{Cmd: cmdStartSysex, Payload: payload}, nil
+
+	default:
+		// Any other command byte in the 0x80..0xEF range is a 3-byte message
+		// per the Firmata spec (ANALOG_MESSAGE, etc.) — consume the 2 data bytes.
+		// Commands 0xF1..0xFF other than the ones we handle above are rare enough
+		// we treat them identically.
+		b1, err := r.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read unknown data1: %w", err)
+		}
+		b2, err := r.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read unknown data2: %w", err)
+		}
+		return UnknownMessage{Cmd: cmd, Payload: []byte{b1, b2}}, nil
+	}
+}
+
+func readUntilEndSysex(r *bufio.Reader) ([]byte, error) {
+	var out []byte
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		if b == cmdEndSysex {
+			return out, nil
+		}
+		out = append(out, b)
+	}
 }
