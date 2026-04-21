@@ -132,8 +132,12 @@ func decode(r *bufio.Reader) (Message, error) {
 	default:
 		// Any other command byte in the 0x80..0xEF range is a 3-byte message
 		// per the Firmata spec (ANALOG_MESSAGE, etc.) — consume the 2 data bytes.
-		// Commands 0xF1..0xFF other than the ones we handle above are rare enough
-		// we treat them identically.
+		// Commands 0xF1..0xFF other than the ones we handle above (e.g. 0xFE
+		// PIN_STATE_RESPONSE outside of sysex, or 0xF8 which is a system-command
+		// reset in some firmwares) technically have varying lengths; the PoC
+		// assumes 2 data bytes since ConfigurableFirmata does not emit those
+		// unsolicited during digital-only GPIO traffic. If we ever add analog
+		// or sysex feature traffic, replace this with a command-length table.
 		b1, err := r.ReadByte()
 		if err != nil {
 			return nil, fmt.Errorf("read unknown data1: %w", err)
