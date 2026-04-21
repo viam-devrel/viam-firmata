@@ -125,3 +125,19 @@ func (c *Client) writeFrame(frame []byte) error {
 	_, err := c.rw.Write(frame)
 	return err
 }
+
+func (c *Client) SetPinMode(pin int, mode PinMode) error {
+	if pin < 0 || pin > 127 {
+		return fmt.Errorf("pin %d out of range", pin)
+	}
+	return c.writeFrame(encodePinMode(uint8(pin), mode))
+}
+
+// EnableDigitalReporting enables or disables auto-reporting for a port.
+// NOTE: port is a port index (pin/8), not a pin number.
+func (c *Client) EnableDigitalReporting(port int, enable bool) error {
+	if port < 0 || port > 15 {
+		return fmt.Errorf("port %d out of range", port)
+	}
+	return c.writeFrame(encodeReportDigital(uint8(port), enable))
+}

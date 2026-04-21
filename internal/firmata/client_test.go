@@ -1,6 +1,7 @@
 package firmata
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"testing"
@@ -87,5 +88,42 @@ func TestHandshakeTimesOut(t *testing.T) {
 	_, _, err := c.Handshake(ctx)
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
+	}
+}
+
+// readN reads exactly n bytes or fails the test.
+func readN(t *testing.T, r io.Reader, n int) []byte {
+	t.Helper()
+	buf := make([]byte, n)
+	_, err := io.ReadFull(r, buf)
+	if err != nil {
+		t.Fatalf("ReadFull: %v", err)
+	}
+	return buf
+}
+
+func TestSetPinModeWritesBytes(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	go func() { _ = c.SetPinMode(13, PinModeOutput) }()
+	got := readN(t, pp.board, 3)
+	want := []byte{0xF4, 0x0D, 0x01}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+}
+
+func TestEnableDigitalReportingWritesBytes(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	go func() { _ = c.EnableDigitalReporting(0, true) }()
+	got := readN(t, pp.board, 2)
+	want := []byte{0xD0, 0x01}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
 	}
 }
