@@ -97,13 +97,14 @@ func (c *Client) dispatchDigital(m DigitalPortMessage) {
 }
 
 // writeFrame sends an already-encoded frame, honoring writeMu and surfacing
-// any prior reader-side error.
+// any prior reader-side error. The readErr check runs inside the mutex so a
+// late-arriving reader error can't slip between the check and the write.
 func (c *Client) writeFrame(frame []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if errp := c.readErr.Load(); errp != nil {
 		return fmt.Errorf("firmata: stream closed: %w", *errp)
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	_, err := c.rw.Write(frame)
 	return err
 }

@@ -10,9 +10,8 @@ import (
 // host side is what the Client reads/writes. board side is what the "fake Arduino"
 // in the test reads/writes.
 type pipePair struct {
-	hostIn, hostOut *io.PipeWriter
-	host            io.ReadWriteCloser
-	board           io.ReadWriteCloser
+	host  io.ReadWriteCloser
+	board io.ReadWriteCloser
 }
 
 type rwcWrapper struct {
@@ -36,7 +35,7 @@ func newPipePair() *pipePair {
 		Writer: boardW,
 		close:  func() error { _ = boardW.Close(); _ = boardR.Close(); return nil },
 	}
-	return &pipePair{hostIn: boardW, hostOut: hostW, host: host, board: board}
+	return &pipePair{host: host, board: board}
 }
 
 func TestClientCloseStopsReader(t *testing.T) {
