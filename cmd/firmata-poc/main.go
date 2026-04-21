@@ -83,9 +83,7 @@ func run(portPath string, baud, outPin, inPin int, duration, toggleInterval time
 	defer runCancel()
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for ev := range c.Events() {
 			level := "LOW"
 			if ev.High {
@@ -93,7 +91,7 @@ func run(portPath string, baud, outPin, inPin int, duration, toggleInterval time
 			}
 			log.Printf("pin %d -> %s", ev.Pin, level)
 		}
-	}()
+	})
 
 	ticker := time.NewTicker(toggleInterval)
 	defer ticker.Stop()
