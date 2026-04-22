@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"sync"
 	"time"
 
+	"go.viam.com/rdk/components/board"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 
@@ -100,4 +102,70 @@ func (b *firmataBoard) Close(_ context.Context) error {
 		}
 	})
 	return b.closeErr
+}
+
+type firmataGPIOPin struct {
+	board *firmataBoard
+	pin   int
+}
+
+func (b *firmataBoard) GPIOPinByName(name string) (board.GPIOPin, error) {
+	pin, err := strconv.Atoi(name)
+	if err != nil || pin < 0 || pin > 127 {
+		return nil, fmt.Errorf("firmata: invalid pin name %q (want decimal 0-127)", name)
+	}
+	return &firmataGPIOPin{board: b, pin: pin}, nil
+}
+
+// ensureMode sends SET_PIN_MODE only when the pin's cached mode differs from
+// the requested one. For INPUT/INPUT_PULLUP it also enables per-port
+// reporting on first configuration.
+func (p *firmataGPIOPin) ensureMode(mode firmata.PinMode) error {
+	p.board.mu.Lock()
+	defer p.board.mu.Unlock()
+	if current, ok := p.board.pinModes[p.pin]; ok && current == mode {
+		return nil
+	}
+	if err := p.board.client.SetPinMode(p.pin, mode); err != nil {
+		return err
+	}
+	p.board.pinModes[p.pin] = mode
+	if mode == firmata.PinModeInput || mode == firmata.PinModeInputPullup {
+		if err := p.board.client.EnableDigitalReporting(p.pin/8, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *firmataGPIOPin) Set(_ context.Context, high bool, _ map[string]any) error {
+	if err := p.ensureMode(firmata.PinModeOutput); err != nil {
+		return err
+	}
+	return p.board.client.DigitalWrite(p.pin, high)
+}
+
+// Get is implemented in a later task; see firmata_board.go in subsequent tasks.
+func (p *firmataGPIOPin) Get(_ context.Context, _ map[string]any) (bool, error) {
+	return false, errUnimplemented
+}
+
+// PWM is intentionally unimplemented in v1; PWM support is out of scope.
+func (p *firmataGPIOPin) PWM(_ context.Context, _ map[string]any) (float64, error) {
+	return 0, errUnimplemented
+}
+
+// SetPWM is intentionally unimplemented in v1; PWM support is out of scope.
+func (p *firmataGPIOPin) SetPWM(_ context.Context, _ float64, _ map[string]any) error {
+	return errUnimplemented
+}
+
+// PWMFreq is intentionally unimplemented in v1; PWM support is out of scope.
+func (p *firmataGPIOPin) PWMFreq(_ context.Context, _ map[string]any) (uint, error) {
+	return 0, errUnimplemented
+}
+
+// SetPWMFreq is intentionally unimplemented in v1; PWM support is out of scope.
+func (p *firmataGPIOPin) SetPWMFreq(_ context.Context, _ uint, _ map[string]any) error {
+	return errUnimplemented
 }

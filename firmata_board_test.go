@@ -1,9 +1,17 @@
 package firmataboard
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
+
+	"go.viam.com/rdk/components/board"
+	"go.viam.com/rdk/logging"
+
+	"github.com/viam-devrel/viam-firmata/internal/firmata"
 )
 
 func TestConfig_Validate(t *testing.T) {
@@ -47,4 +55,86 @@ func TestConfig_Validate(t *testing.T) {
 	})
 
 	_ = errors.New // keep import used if we add error-type assertions later
+}
+
+// testBoard wires a firmataBoard to an in-process pair of pipes that stand
+// in for an Arduino: everything the board writes ends up in sentBuf; any
+// bytes we hand-craft into arduinoW arrive at the board's read loop.
+type testBoard struct {
+	b        *firmataBoard
+	sentBuf  *bytes.Buffer // everything the board has ever written
+	arduinoW io.WriteCloser
+	cleanup  func()
+}
+
+func newTestBoard(t *testing.T) *testBoard {
+	t.Helper()
+	// board reads ← arduinoR ... arduinoW (test writes here)
+	arduinoR, arduinoW := io.Pipe()
+	// board writes → sentBuf (test reads here via sentBuf.Bytes())
+	sentBuf := &bytes.Buffer{}
+	rw := &rwFake{r: arduinoR, w: sentBuf}
+
+	c := firmata.New(rw)
+	name := board.Named("test")
+	b := newBoardFromClient(name, c, rw, logging.NewTestLogger(t))
+
+	return &testBoard{
+		b:        b,
+		sentBuf:  sentBuf,
+		arduinoW: arduinoW,
+		cleanup: func() {
+			// Close the arduino-side write half FIRST so the board's pipe
+			// reader unblocks with EOF; otherwise b.Close() blocks forever
+			// waiting on the read-loop's drain (rwFake.Close is a no-op).
+			_ = arduinoW.Close()
+			_ = b.Close(context.Background())
+		},
+	}
+}
+
+// rwFake bolts a reader and a writer together. The writer is a *bytes.Buffer
+// that tests can inspect; the reader is an io.Pipe fed by the test.
+// Note: bytes.Buffer is not safe for concurrent use, but in these tests
+// writes come only from the board's writer goroutine and reads happen after
+// we've drained the events channel, so there's a happens-before fence.
+type rwFake struct {
+	r io.Reader
+	w io.Writer
+}
+
+func (f *rwFake) Read(p []byte) (int, error)  { return f.r.Read(p) }
+func (f *rwFake) Write(p []byte) (int, error) { return f.w.Write(p) }
+func (f *rwFake) Close() error                { return nil }
+
+func TestGPIOPin_Set_EmitsPinModeOnceThenDigitalWrites(t *testing.T) {
+	tb := newTestBoard(t)
+	defer tb.cleanup()
+
+	ctx := context.Background()
+	pin, err := tb.b.GPIOPinByName("13")
+	if err != nil {
+		t.Fatalf("GPIOPinByName: %v", err)
+	}
+
+	if err := pin.Set(ctx, true, nil); err != nil {
+		t.Fatalf("first Set: %v", err)
+	}
+	if err := pin.Set(ctx, false, nil); err != nil {
+		t.Fatalf("second Set: %v", err)
+	}
+
+	// Expected wire bytes:
+	//   SET_PIN_MODE(13, OUTPUT)   = 0xF4, 0x0D, 0x01
+	//   DIGITAL_MESSAGE port=1,high = 0x91, 0x20, 0x00   (pin 13 is bit 5 of port 1; 1<<5 = 0x20)
+	//   DIGITAL_MESSAGE port=1,low  = 0x91, 0x00, 0x00
+	want := []byte{
+		0xF4, 0x0D, 0x01,
+		0x91, 0x20, 0x00,
+		0x91, 0x00, 0x00,
+	}
+	got := tb.sentBuf.Bytes()
+	if !bytes.Equal(got, want) {
+		t.Fatalf("wire bytes mismatch:\n got = %x\nwant = %x", got, want)
+	}
 }
