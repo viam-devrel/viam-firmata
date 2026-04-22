@@ -209,10 +209,14 @@ func NewBoard(ctx context.Context, _ resource.Dependencies, conf resource.Config
 		return nil, fmt.Errorf("open %s: %w", cfg.SerialPath, err)
 	}
 
-	_ = sp.SetDTR(false)
+	if err := sp.SetDTR(false); err != nil {
+		logger.Debugf("firmata board: SetDTR(false) not supported: %v", err)
+	}
 	time.Sleep(100 * time.Millisecond)
-	_ = sp.SetDTR(true)
-	logger.Infof("firmata: waiting %s for auto-reset on %s", resetDelay, cfg.SerialPath)
+	if err := sp.SetDTR(true); err != nil {
+		logger.Debugf("firmata board: SetDTR(true) not supported: %v", err)
+	}
+	logger.Infof("firmata board: waiting %s for auto-reset on %s", resetDelay, cfg.SerialPath)
 	select {
 	case <-time.After(resetDelay):
 	case <-ctx.Done():
@@ -230,7 +234,7 @@ func NewBoard(ctx context.Context, _ resource.Dependencies, conf resource.Config
 		_ = sp.Close()
 		return nil, fmt.Errorf("handshake on %s: %w", cfg.SerialPath, err)
 	}
-	logger.Infof("firmata: connected to %s — firmware v%d.%d", cfg.SerialPath, major, minor)
+	logger.Infof("firmata board: connected to %s — firmware v%d.%d", cfg.SerialPath, major, minor)
 
 	return newBoardFromClient(conf.ResourceName(), c, sp, logger), nil
 }
