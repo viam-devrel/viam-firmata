@@ -101,6 +101,65 @@ go test ./...
 go test -race ./...
 ```
 
+## Using as a Viam module
+
+This repo also ships a Viam `board` component module that lets a machine
+running `viam-server` drive digital GPIO over the same Firmata connection.
+
+**Prerequisite:** flash ConfigurableFirmata as described above. The same
+hardware that runs `firmata-poc` is what `viam-server` talks to.
+
+**Build the module binary:**
+
+```sh
+make build
+# produces ./bin/viam-firmata
+```
+
+**Local machine config snippet:** (replace the executable path with your
+absolute path, and `serial_path` with the port from `arduino-cli board list`)
+
+```json
+{
+  "modules": [
+    {
+      "name": "firmata",
+      "type": "local",
+      "executable_path": "/absolute/path/to/viam-firmata/bin/viam-firmata"
+    }
+  ],
+  "components": [
+    {
+      "name": "my-firmata-board",
+      "api": "rdk:component:board",
+      "model": "devrel:firmata:board",
+      "attributes": {
+        "serial_path": "/dev/tty.usbmodem14201",
+        "baud_rate": 57600
+      }
+    }
+  ]
+}
+```
+
+**Scope (v1):** digital pins only — `GPIOPinByName(name).Set/Get`. PWM,
+analog, and digital-interrupt methods return an "unimplemented" error.
+
+**Registry install** (after the first tagged release is cloud-built and
+uploaded) — replace the local module stanza with:
+
+```json
+{
+  "modules": [
+    {
+      "name": "firmata",
+      "type": "registry",
+      "module_id": "devrel:firmata"
+    }
+  ]
+}
+```
+
 ## Design docs
 
 - Spec: [`docs/superpowers/specs/2026-04-21-viam-firmata-poc-design.md`](docs/superpowers/specs/2026-04-21-viam-firmata-poc-design.md)
