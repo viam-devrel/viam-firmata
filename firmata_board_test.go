@@ -138,3 +138,64 @@ func TestGPIOPin_Set_EmitsPinModeOnceThenDigitalWrites(t *testing.T) {
 		t.Fatalf("wire bytes mismatch:\n got = %x\nwant = %x", got, want)
 	}
 }
+
+func TestGPIOPin_Get_FirstCallEnablesReportingThenReadsCachedState(t *testing.T) {
+	tb := newTestBoard(t)
+	defer tb.cleanup()
+
+	ctx := context.Background()
+	pin, err := tb.b.GPIOPinByName("2")
+	if err != nil {
+		t.Fatalf("GPIOPinByName: %v", err)
+	}
+
+	// First Get: configures pin mode + enables reporting. Cached input state
+	// for port 0 is all-zero, so the returned value is false.
+	val, err := pin.Get(ctx, nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if val {
+		t.Fatalf("expected false before any frame, got true")
+	}
+
+	want := []byte{
+		0xF4, 0x02, 0x0B, // SET_PIN_MODE(2, INPUT_PULLUP)
+		0xD0, 0x01, // REPORT_DIGITAL(port=0, enable)
+	}
+	got := tb.sentBuf.Bytes()
+	if !bytes.Equal(got, want) {
+		t.Fatalf("wire bytes mismatch:\n got = %x\nwant = %x", got, want)
+	}
+
+	// Inject a DIGITAL_MESSAGE from the "Arduino" side: port 0, mask 0x04 (pin 2 HIGH).
+	if _, err := tb.arduinoW.Write([]byte{0x90, 0x04, 0x00}); err != nil {
+		t.Fatalf("inject frame: %v", err)
+	}
+
+	// Wait briefly for the reader goroutine + drain goroutine to process.
+	// We can't synchronize on Events() here (the drain goroutine owns it), so
+	// poll Get for up to 1s.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if v, _ := pin.Get(ctx, nil); v {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	val, err = pin.Get(ctx, nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !val {
+		t.Fatalf("expected true after DIGITAL_MESSAGE, got false")
+	}
+
+	// A second Get must not resend SET_PIN_MODE or REPORT_DIGITAL.
+	sentAfterFirstGet := len(want)
+	if extra := tb.sentBuf.Len() - sentAfterFirstGet; extra != 0 {
+		t.Fatalf("unexpected %d extra bytes on second Get: %x", extra,
+			tb.sentBuf.Bytes()[sentAfterFirstGet:])
+	}
+}

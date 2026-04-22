@@ -149,9 +149,15 @@ func (p *firmataGPIOPin) Set(_ context.Context, high bool, _ map[string]any) err
 	return p.board.client.DigitalWrite(p.pin, high)
 }
 
-// Get is implemented in a later task; see firmata_board.go in subsequent tasks.
+// Get configures the pin as INPUT_PULLUP on first call (which also enables
+// per-port reporting) and returns the latest cached state from the firmata
+// reader goroutine. No I/O happens on subsequent calls once the pin mode is
+// cached.
 func (p *firmataGPIOPin) Get(_ context.Context, _ map[string]any) (bool, error) {
-	return false, errUnimplemented
+	if err := p.ensureMode(firmata.PinModeInputPullup); err != nil {
+		return false, err
+	}
+	return p.board.client.ReadDigital(p.pin), nil
 }
 
 // PWM is intentionally unimplemented in v1; PWM support is out of scope.
