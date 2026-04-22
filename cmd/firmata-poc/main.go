@@ -15,7 +15,7 @@ import (
 
 	"go.bug.st/serial"
 
-	"github.com/viam-labs/viam-firmata/internal/firmata"
+	"github.com/viam-devrel/viam-firmata/internal/firmata"
 )
 
 func main() {
