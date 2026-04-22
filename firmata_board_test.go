@@ -53,8 +53,6 @@ func TestConfig_Validate(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
-
-	_ = errors.New // keep import used if we add error-type assertions later
 }
 
 // testBoard wires a firmataBoard to an in-process pair of pipes that stand
@@ -197,5 +195,44 @@ func TestGPIOPin_Get_FirstCallEnablesReportingThenReadsCachedState(t *testing.T)
 	if extra := tb.sentBuf.Len() - sentAfterFirstGet; extra != 0 {
 		t.Fatalf("unexpected %d extra bytes on second Get: %x", extra,
 			tb.sentBuf.Bytes()[sentAfterFirstGet:])
+	}
+}
+
+func TestUnimplementedMethods_ReturnSentinelError(t *testing.T) {
+	tb := newTestBoard(t)
+	defer tb.cleanup()
+	ctx := context.Background()
+
+	// GPIOPin PWM family.
+	pin, _ := tb.b.GPIOPinByName("5")
+	if _, err := pin.PWM(ctx, nil); !errors.Is(err, errUnimplemented) {
+		t.Errorf("PWM: want errUnimplemented, got %v", err)
+	}
+	if err := pin.SetPWM(ctx, 0.5, nil); !errors.Is(err, errUnimplemented) {
+		t.Errorf("SetPWM: want errUnimplemented, got %v", err)
+	}
+	if _, err := pin.PWMFreq(ctx, nil); !errors.Is(err, errUnimplemented) {
+		t.Errorf("PWMFreq: want errUnimplemented, got %v", err)
+	}
+	if err := pin.SetPWMFreq(ctx, 1000, nil); !errors.Is(err, errUnimplemented) {
+		t.Errorf("SetPWMFreq: want errUnimplemented, got %v", err)
+	}
+
+	// Board-level.
+	if _, err := tb.b.AnalogByName("a0"); !errors.Is(err, errUnimplemented) {
+		t.Errorf("AnalogByName: want errUnimplemented, got %v", err)
+	}
+	if _, err := tb.b.DigitalInterruptByName("d0"); !errors.Is(err, errUnimplemented) {
+		t.Errorf("DigitalInterruptByName: want errUnimplemented, got %v", err)
+	}
+}
+
+func TestGPIOPinByName_RejectsInvalid(t *testing.T) {
+	tb := newTestBoard(t)
+	defer tb.cleanup()
+	for _, name := range []string{"", "abc", "-1", "128", "13.0"} {
+		if _, err := tb.b.GPIOPinByName(name); err == nil {
+			t.Errorf("GPIOPinByName(%q): want error, got nil", name)
+		}
 	}
 }

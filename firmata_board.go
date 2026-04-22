@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	pb "go.viam.com/api/component/board/v1"
 	"go.viam.com/rdk/components/board"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
@@ -179,3 +180,28 @@ func (p *firmataGPIOPin) PWMFreq(_ context.Context, _ map[string]any) (uint, err
 func (p *firmataGPIOPin) SetPWMFreq(_ context.Context, _ uint, _ map[string]any) error {
 	return errUnimplemented
 }
+
+// --- Board-level methods outside the v1 digital-GPIO scope ---
+
+func (b *firmataBoard) AnalogByName(string) (board.Analog, error) {
+	return nil, errUnimplemented
+}
+
+func (b *firmataBoard) DigitalInterruptByName(string) (board.DigitalInterrupt, error) {
+	return nil, errUnimplemented
+}
+
+func (b *firmataBoard) SetPowerMode(_ context.Context, _ pb.PowerMode, _ *time.Duration, _ map[string]any) error {
+	return errUnimplemented
+}
+
+func (b *firmataBoard) StreamTicks(_ context.Context, _ []board.DigitalInterrupt, _ chan board.Tick, _ map[string]any) error {
+	return errUnimplemented
+}
+
+// Compile-time assertions that our types satisfy the full board interfaces.
+// If RDK adds new methods, the build will fail here pointing to the missing one.
+var (
+	_ board.Board   = (*firmataBoard)(nil)
+	_ board.GPIOPin = (*firmataGPIOPin)(nil)
+)
