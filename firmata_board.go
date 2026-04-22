@@ -61,6 +61,10 @@ type firmataBoard struct {
 	closeOnce sync.Once
 	closeErr  error
 
+	// mu serializes pin-mode bookkeeping. Held across blocking firmata I/O in
+	// ensureMode, so all pin-mode changes are serialized board-wide. Acceptable
+	// for v1 single-board, low-frequency GPIO. Follow-up: per-pin mutex for
+	// finer-grained concurrency if this becomes a bottleneck.
 	mu       sync.Mutex
 	pinModes map[int]firmata.PinMode
 }
@@ -129,12 +133,12 @@ func (p *firmataGPIOPin) ensureMode(mode firmata.PinMode) error {
 	if err := p.board.client.SetPinMode(p.pin, mode); err != nil {
 		return err
 	}
-	p.board.pinModes[p.pin] = mode
 	if mode == firmata.PinModeInput || mode == firmata.PinModeInputPullup {
 		if err := p.board.client.EnableDigitalReporting(p.pin/8, true); err != nil {
 			return err
 		}
 	}
+	p.board.pinModes[p.pin] = mode
 	return nil
 }
 
