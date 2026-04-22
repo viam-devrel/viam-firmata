@@ -55,15 +55,18 @@ func (c *Client) Close() error {
 // readLoop decodes frames until the underlying stream errors out.
 // It dispatches recognized frames to the appropriate channels and exits cleanly,
 // closing events and storing any error in readErr for the next writer to surface.
+// EOF/ErrClosedPipe are only suppressed when Close() was called locally; an EOF
+// from the remote end (e.g. Arduino disconnect) surfaces as a stream error.
 func (c *Client) readLoop() {
 	defer close(c.readerDone)
 	defer close(c.events)
 	for {
 		msg, err := decode(c.br)
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
-				c.readErr.Store(&err)
+			if c.closed.Load() && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe)) {
+				return
 			}
+			c.readErr.Store(&err)
 			return
 		}
 		switch m := msg.(type) {

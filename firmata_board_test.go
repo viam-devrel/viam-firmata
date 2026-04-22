@@ -242,3 +242,34 @@ func TestGPIOPinByName_RejectsInvalid(t *testing.T) {
 		}
 	}
 }
+
+func TestSet_AfterStreamClose_ReturnsError(t *testing.T) {
+	tb := newTestBoard(t)
+	defer tb.cleanup()
+
+	// Close the "Arduino" side: the Client's reader will observe io.EOF and
+	// store the error; the next write from the board must surface it.
+	if err := tb.arduinoW.Close(); err != nil {
+		t.Fatalf("close arduinoW: %v", err)
+	}
+
+	// Give the reader goroutine a beat to propagate the error.
+	time.Sleep(50 * time.Millisecond)
+
+	pin, _ := tb.b.GPIOPinByName("13")
+	// Note: depending on timing, first Set may still succeed (SET_PIN_MODE is
+	// write-only, readErr is only surfaced when it has been set). Poll for up
+	// to 1s for the error to materialize.
+	deadline := time.Now().Add(time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lastErr = pin.Set(context.Background(), true, nil)
+		if lastErr != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if lastErr == nil {
+		t.Fatalf("expected an error after stream close, got nil")
+	}
+}
