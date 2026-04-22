@@ -225,6 +225,12 @@ func TestUnimplementedMethods_ReturnSentinelError(t *testing.T) {
 	if _, err := tb.b.DigitalInterruptByName("d0"); !errors.Is(err, errUnimplemented) {
 		t.Errorf("DigitalInterruptByName: want errUnimplemented, got %v", err)
 	}
+	if err := tb.b.SetPowerMode(ctx, 0, nil, nil); !errors.Is(err, errUnimplemented) {
+		t.Errorf("SetPowerMode: want errUnimplemented, got %v", err)
+	}
+	if err := tb.b.StreamTicks(ctx, nil, nil, nil); !errors.Is(err, errUnimplemented) {
+		t.Errorf("StreamTicks: want errUnimplemented, got %v", err)
+	}
 }
 
 func TestGPIOPinByName_RejectsInvalid(t *testing.T) {

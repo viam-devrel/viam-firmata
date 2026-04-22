@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"go.bug.st/serial"
 	pb "go.viam.com/api/component/board/v1"
 	"go.viam.com/rdk/components/board"
 	"go.viam.com/rdk/logging"
@@ -117,7 +118,7 @@ type firmataGPIOPin struct {
 func (b *firmataBoard) GPIOPinByName(name string) (board.GPIOPin, error) {
 	pin, err := strconv.Atoi(name)
 	if err != nil || pin < 0 || pin > 127 {
-		return nil, fmt.Errorf("firmata: invalid pin name %q (want decimal 0-127)", name)
+		return nil, fmt.Errorf("firmata board: invalid pin name %q (want decimal 0-127)", name)
 	}
 	return &firmataGPIOPin{board: b, pin: pin}, nil
 }
@@ -181,6 +182,59 @@ func (p *firmataGPIOPin) SetPWMFreq(_ context.Context, _ uint, _ map[string]any)
 	return errUnimplemented
 }
 
+// NewBoard is the constructor registered with the Viam resource manager.
+// It opens the serial port, toggles DTR to reset the Arduino, waits for the
+// auto-reset window, runs the Firmata handshake, and returns a live board.
+func NewBoard(ctx context.Context, _ resource.Dependencies, conf resource.Config, logger logging.Logger) (board.Board, error) {
+	cfg, err := resource.NativeConfig[*Config](conf)
+	if err != nil {
+		return nil, err
+	}
+
+	baud := cfg.BaudRate
+	if baud == 0 {
+		baud = 57600
+	}
+	resetDelay := cfg.AutoResetDelay
+	if resetDelay == 0 {
+		resetDelay = 2 * time.Second
+	}
+	hsTimeout := cfg.HandshakeTimeout
+	if hsTimeout == 0 {
+		hsTimeout = 5 * time.Second
+	}
+
+	sp, err := serial.Open(cfg.SerialPath, &serial.Mode{BaudRate: baud})
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", cfg.SerialPath, err)
+	}
+
+	_ = sp.SetDTR(false)
+	time.Sleep(100 * time.Millisecond)
+	_ = sp.SetDTR(true)
+	logger.Infof("firmata: waiting %s for auto-reset on %s", resetDelay, cfg.SerialPath)
+	select {
+	case <-time.After(resetDelay):
+	case <-ctx.Done():
+		_ = sp.Close()
+		return nil, ctx.Err()
+	}
+
+	c := firmata.New(sp)
+
+	hsCtx, cancel := context.WithTimeout(ctx, hsTimeout)
+	major, minor, err := c.Handshake(hsCtx)
+	cancel()
+	if err != nil {
+		_ = c.Close()
+		_ = sp.Close()
+		return nil, fmt.Errorf("handshake on %s: %w", cfg.SerialPath, err)
+	}
+	logger.Infof("firmata: connected to %s — firmware v%d.%d", cfg.SerialPath, major, minor)
+
+	return newBoardFromClient(conf.ResourceName(), c, sp, logger), nil
+}
+
 // --- Board-level methods outside the v1 digital-GPIO scope ---
 
 func (b *firmataBoard) AnalogByName(string) (board.Analog, error) {
@@ -205,3 +259,12 @@ var (
 	_ board.Board   = (*firmataBoard)(nil)
 	_ board.GPIOPin = (*firmataGPIOPin)(nil)
 )
+
+func init() {
+	resource.RegisterComponent(
+		board.API, Model,
+		resource.Registration[board.Board, *Config]{
+			Constructor: NewBoard,
+		},
+	)
+}
