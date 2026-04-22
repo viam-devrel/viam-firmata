@@ -205,3 +205,62 @@ func collect(t *testing.T, ch <-chan PinChange, n int, timeout time.Duration) []
 	}
 	return out
 }
+
+func TestReadDigital_BeforeAndAfterDispatch(t *testing.T) {
+	arduinoR, clientW := io.Pipe()
+	clientR, arduinoW := io.Pipe()
+	defer arduinoR.Close()
+	defer arduinoW.Close()
+
+	// Wrap the two pipes as an io.ReadWriteCloser for the Client.
+	rw := &rwAdapter{r: clientR, w: clientW}
+	c := New(rw)
+	defer c.Close()
+
+	// Before any DIGITAL_MESSAGE has arrived, all pins read false.
+	if c.ReadDigital(2) {
+		t.Fatalf("ReadDigital(2) before any frame: got true, want false")
+	}
+
+	// Push a DIGITAL_MESSAGE for port 0 with bit 2 set (pin 2 = HIGH).
+	// Encoding: 0x90 | 0 = 0x90, data1 = 0x04, data2 = 0x00.
+	_, err := arduinoW.Write([]byte{0x90, 0x04, 0x00})
+	if err != nil {
+		t.Fatalf("write frame: %v", err)
+	}
+
+	// Wait for the reader goroutine to process the frame.
+	// The existing Client exposes Events(); drain one and then read.
+	select {
+	case ev := <-c.Events():
+		if ev.Pin != 2 || !ev.High {
+			t.Fatalf("unexpected event: %+v", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("no event received")
+	}
+
+	if !c.ReadDigital(2) {
+		t.Fatalf("ReadDigital(2) after dispatch: got false, want true")
+	}
+	if c.ReadDigital(1) {
+		t.Fatalf("ReadDigital(1) unrelated bit: got true, want false")
+	}
+	if c.ReadDigital(-1) || c.ReadDigital(128) {
+		t.Fatalf("out-of-range pins should return false")
+	}
+}
+
+type rwAdapter struct {
+	r io.ReadCloser
+	w io.WriteCloser
+}
+
+func (a *rwAdapter) Read(p []byte) (int, error)  { return a.r.Read(p) }
+func (a *rwAdapter) Write(p []byte) (int, error) { return a.w.Write(p) }
+func (a *rwAdapter) Close() error {
+	// Close both ends so the Client's reader goroutine, which is blocked
+	// on the read side, unblocks and lets Close() return.
+	_ = a.r.Close()
+	return a.w.Close()
+}

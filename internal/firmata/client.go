@@ -25,6 +25,7 @@ type Client struct {
 	readErr    atomic.Pointer[error]
 	readerDone chan struct{}
 	writeMu    sync.Mutex
+	stateMu    sync.RWMutex // guards portState for external readers
 	closed     atomic.Bool
 }
 
@@ -83,7 +84,11 @@ func (c *Client) readLoop() {
 // dispatchDigital diffs the new port mask against the last-known one
 // and emits one PinChange per changed bit.
 func (c *Client) dispatchDigital(m DigitalPortMessage) {
+	c.stateMu.Lock()
 	prev := c.portState[m.Port]
+	c.portState[m.Port] = m.Mask
+	c.stateMu.Unlock()
+
 	changed := prev ^ m.Mask
 	for bit := uint8(0); bit < 8; bit++ {
 		if changed&(1<<bit) == 0 {
@@ -94,7 +99,6 @@ func (c *Client) dispatchDigital(m DigitalPortMessage) {
 			High: m.Mask&(1<<bit) != 0,
 		}
 	}
-	c.portState[m.Port] = m.Mask
 }
 
 // Handshake blocks until the firmware sends a REPORT_VERSION frame or ctx expires.
@@ -163,4 +167,19 @@ func (c *Client) DigitalWrite(pin int, high bool) error {
 	}
 	_, err := c.rw.Write(encodeDigitalPortWrite(port, c.outState[port]))
 	return err
+}
+
+// ReadDigital returns the cached input level of a digital pin.
+// Returns false if the pin is out of range [0, 127] or if no DIGITAL_MESSAGE
+// has yet been received for the pin's port (i.e. reporting was never enabled
+// or nothing has changed since the port was enabled).
+func (c *Client) ReadDigital(pin int) bool {
+	if pin < 0 || pin > 127 {
+		return false
+	}
+	port := uint8(pin / 8)
+	bit := uint8(pin % 8)
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return c.portState[port]&(1<<bit) != 0
 }
