@@ -1,0 +1,22 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "devrel:firmata",
+  "visibility": "public",
+  "url": "https://github.com/viam-devrel/viam-firmata",
+  "description": "Firmata-over-serial board component for Arduino / ConfigurableFirmata devices.",
+  "models": [
+    {
+      "api": "rdk:component:board",
+      "model": "devrel:firmata:board",
+      "short_description": "Digital GPIO via ConfigurableFirmata over USB serial."
+    }
+  ],
+  "entrypoint": "bin/viam-firmata",
+  "build": {
+    "setup": "./setup.sh",
+    "build": "./build.sh",
+    "path": "module.tar.gz",
+    "arch": ["linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64"]
+  },
+  "markdown_link": "README.md"
+}
