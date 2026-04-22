@@ -56,6 +56,9 @@ type firmataBoard struct {
 
 	drainDone chan struct{}
 
+	closeOnce sync.Once
+	closeErr  error
+
 	mu       sync.Mutex
 	pinModes map[int]firmata.PinMode
 }
@@ -89,10 +92,12 @@ func (b *firmataBoard) drainEvents() {
 // Close tears down the client and the underlying transport and waits for the
 // drain goroutine to exit. Idempotent.
 func (b *firmataBoard) Close(_ context.Context) error {
-	err := b.client.Close() // unblocks reader → closes events → drain exits
-	<-b.drainDone
-	if cerr := b.closer.Close(); err == nil {
-		err = cerr
-	}
-	return err
+	b.closeOnce.Do(func() {
+		b.closeErr = b.client.Close() // unblocks reader → closes events → drain exits
+		<-b.drainDone
+		if cerr := b.closer.Close(); b.closeErr == nil {
+			b.closeErr = cerr
+		}
+	})
+	return b.closeErr
 }
