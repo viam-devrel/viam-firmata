@@ -212,7 +212,12 @@ func NewBoard(ctx context.Context, _ resource.Dependencies, conf resource.Config
 	if err := sp.SetDTR(false); err != nil {
 		logger.Debugf("firmata board: SetDTR(false) not supported: %v", err)
 	}
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-time.After(100 * time.Millisecond):
+	case <-ctx.Done():
+		_ = sp.Close()
+		return nil, ctx.Err()
+	}
 	if err := sp.SetDTR(true); err != nil {
 		logger.Debugf("firmata board: SetDTR(true) not supported: %v", err)
 	}
