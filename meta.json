@@ -8,7 +8,8 @@
     {
       "api": "rdk:component:board",
       "model": "devrel:firmata:board",
-      "short_description": "Digital GPIO via ConfigurableFirmata over USB serial."
+      "short_description": "Digital GPIO via ConfigurableFirmata over USB serial.",
+      "markdown_link": "README.md#model-devrelfirmataboard"
     }
   ],
   "entrypoint": "bin/viam-firmata",
