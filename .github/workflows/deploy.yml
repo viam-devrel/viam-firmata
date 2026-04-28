@@ -1,9 +1,9 @@
 name: Module cloud build and upload
 
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types:
+      - released
 
 jobs:
   upload:
