@@ -25,6 +25,7 @@
 | `firmata_board.go` | Modify | Extend `Config` (`Analogs`, `SamplingIntervalMs`) + `Validate`. Add `parseAnalogPin`/`resolveAnalogPin` helpers. Add `firmataAnalog` struct. Add `pinSupports` helper, `ownedPins` map, `pwmDuty` cache. Implement `AnalogByName`, `firmataGPIOPin.SetPWM`/`PWM`, ownership checks on `Set`/`Get`. Extend `NewBoard` with capability + analog-mapping queries and analog construction. |
 | `firmata_board_test.go` | Modify | Replace/extend the test helper to inject canonical handshake + capability + analog-mapping responses. Add coverage for analog Read, PWM, ownership, validation, sampling interval, and capability rejection. Update `TestUnimplementedMethods_ReturnSentinelError` for the methods that are no longer unimplemented. |
 | `README.md` | Modify | Update v1 scope section, add "Analog and PWM" section with example config, document the fixed-PWM-frequency caveat and the ignored per-pin `samples_per_sec` field. |
+| `meta.json` | Modify | Update `description` and the `models[0].short_description` to reflect that the model now does analog + PWM, not just digital GPIO. (The registry version is bumped via the next git tag, not via meta.json.) |
 
 No new files are created. No file is deleted. No package-rename or module-path change.
 
@@ -1364,18 +1365,18 @@ Add `parseAnalogPin` near the bottom of the file:
 //	"14"  -> (digitalPin: 14, analogChannel: -1)
 func parseAnalogPin(s string) (digitalPin int, analogChannel int, err error) {
 	if s == "" {
-		return 0, 0, fmt.Errorf("analog pin name is empty")
+		return -1, -1, fmt.Errorf("analog pin name is empty")
 	}
 	if s[0] == 'A' || s[0] == 'a' {
 		n, err := strconv.Atoi(s[1:])
 		if err != nil || n < 0 || n > 15 {
-			return 0, 0, fmt.Errorf("invalid analog pin %q (want \"A0\".. \"A15\")", s)
+			return -1, -1, fmt.Errorf("invalid analog pin %q (want \"A0\".. \"A15\")", s)
 		}
 		return -1, n, nil
 	}
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 0 || n > 127 {
-		return 0, 0, fmt.Errorf("invalid analog pin %q (want \"A0\".. \"A15\" or 0..127)", s)
+		return -1, -1, fmt.Errorf("invalid analog pin %q (want \"A0\".. \"A15\" or 0..127)", s)
 	}
 	return n, -1, nil
 }
@@ -1602,7 +1603,13 @@ func unoAnalogMap() firmata.AnalogMappingResponse {
 }
 
 // newTestBoardWithCaps builds a testBoard with the supplied capability +
-// analog-mapping data already injected. analogs may be empty.
+// analog-mapping data already injected.
+//
+// IMPORTANT: until Task 13 lands a real resolveAnalogPin, callers MUST pass
+// an empty (or nil) analogs slice. The Task-12 stub of resolveAnalogPin
+// always errors, and the helper t.Fatalfs on that error. No test in Task 12
+// references this helper with non-empty analogs; tests that need declared
+// analogs are introduced in Task 13.
 func newTestBoardWithCaps(
 	t *testing.T,
 	caps firmata.CapabilityResponse,
@@ -1886,11 +1893,17 @@ Expected: PASS.
 
 - [ ] **Step 6: Run the whole suite**
 
-Run: `go test -race ./...`
-Expected: regress on `TestUnimplementedMethods_ReturnSentinelError` — `AnalogByName("a0")` no longer returns `errUnimplemented` (it returns the "no analog named" error). We'll fix that test in Task 17. For now, leave the failure visible.
+> **Important — expected regression between Tasks 13 and 17:**
+> Starting at Task 13, `TestUnimplementedMethods_ReturnSentinelError` fails because `AnalogByName("a0")` no longer returns `errUnimplemented` (it now returns "no analog named"), and similar for `SetPWM`/`PWM`. **This is expected.** Task 17 tightens the test to the methods that genuinely remain unimplemented. While iterating between Tasks 13 and 16, prefer running a scoped suite to avoid the noise:
+>
+> ```sh
+> go test -run "^(TestConfig|TestResolveAnalogPin|TestAnalogRead|TestAnalogWrite_OnAnalogReader|TestGPIOPin|TestSet_AfterStreamClose|TestSetPWM|TestPWM_Defaults|TestConstructor|TestInitializeAnalogs)" -race ./...
+> ```
+>
+> The full `go test -race ./...` returns to green at the end of Task 17.
 
-If the regression makes you nervous, scope the test run for now: `go test -run "^(TestConfig|TestResolveAnalogPin|TestAnalogRead|TestAnalogWrite_OnAnalogReader|TestGPIOPin|TestSet_AfterStreamClose)" -race ./...`
-Expected: PASS.
+Run: `go test -race ./...`
+Expected: regress on `TestUnimplementedMethods_ReturnSentinelError` (per the callout above).
 
 - [ ] **Step 7: Commit**
 
@@ -2204,31 +2217,89 @@ EOF
 
 ---
 
-## Task 16: Board — extend `NewBoard` to wire up capabilities and analogs
+## Task 16: Board — `initializeAnalogs` seam + extend `NewBoard`
 
 **Files:**
 - Modify: `/Users/nick.hehr/src/viam-firmata/firmata_board.go`
 - Modify: `/Users/nick.hehr/src/viam-firmata/firmata_board_test.go`
 
-This is the only constructor-level change. The existing `newBoardFromClient` stays as-is (it's the test-only direct injection point used by `newTestBoard`/`newTestBoardWithCaps`).
+The post-handshake work (capability query → analog-mapping query → optional sampling-interval → build `analogs`/`ownedPins`) is extracted into a single method `initializeAnalogs(ctx, cfg, logger) error` on `*firmataBoard`. **Both `NewBoard` and the new test harness call it**, so tests genuinely gate the production path: the implementer cannot skip the `NewBoard` edit and have tests still pass — the seam exists in exactly one place.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Add the `initializeAnalogs` method (no test gate yet)**
 
-We need a different harness to drive the full constructor end-to-end over a pipe. Add a new helper and one cohesive integration test.
+In `firmata_board.go`, add right after `pinSupports`:
+
+```go
+// initializeAnalogs runs the post-handshake board setup: capability query,
+// analog-mapping query, optional SAMPLING_INTERVAL emit, and then builds
+// the analogs / ownedPins maps from cfg.Analogs.
+//
+// On any error the board is left in a partially-initialized state — caller
+// is responsible for calling Close(). This is the single source of truth
+// for the analog initialization sequence: NewBoard and the test harness
+// both call it so a single edit point gates both production and tests.
+func (b *firmataBoard) initializeAnalogs(ctx context.Context, cfg *Config, logger logging.Logger) error {
+	caps, err := b.client.QueryCapabilities(ctx)
+	if err != nil {
+		return fmt.Errorf("capability query: %w", err)
+	}
+	amap, err := b.client.QueryAnalogMapping(ctx)
+	if err != nil {
+		return fmt.Errorf("analog mapping query: %w", err)
+	}
+
+	if cfg.SamplingIntervalMs > 0 {
+		if err := b.client.SetSamplingInterval(cfg.SamplingIntervalMs); err != nil {
+			return fmt.Errorf("set sampling interval: %w", err)
+		}
+	}
+
+	b.capabilities = caps
+	b.analogMap = amap
+
+	for _, ac := range cfg.Analogs {
+		dpin, ch, err := parseAnalogPin(ac.Pin)
+		if err != nil {
+			return fmt.Errorf("analog %q: %w", ac.Name, err)
+		}
+		dpin, ch, err = resolveAnalogPin(dpin, ch, amap)
+		if err != nil {
+			return fmt.Errorf("analog %q: %w", ac.Name, err)
+		}
+		if !b.pinSupports(dpin, firmata.PinModeAnalog) {
+			return fmt.Errorf("analog %q: pin %d does not support analog mode", ac.Name, dpin)
+		}
+		if ac.SamplesPerSecond != 0 {
+			logger.Warnf("firmata board: analog %q samples_per_sec=%d ignored — Firmata only supports a global sampling_interval_ms",
+				ac.Name, ac.SamplesPerSecond)
+		}
+		b.analogs[ac.Name] = &firmataAnalog{
+			board: b, name: ac.Name, digitalPin: dpin, channel: uint8(ch),
+		}
+		b.ownedPins[dpin] = ac.Name
+	}
+
+	return nil
+}
+```
+
+- [ ] **Step 2: Verify compile**
+
+Run: `go build ./...`
+Expected: success. (Method is added but not yet called from anywhere.)
+
+- [ ] **Step 3: Write the failing tests for the constructor flow**
 
 Add to `firmata_board_test.go`:
 
 ```go
-// runConstructorWithFakeFirmware builds a *firmataBoard via the production
-// path (newBoard equivalent that takes an io.ReadWriteCloser injected via a
-// helper hook), with the fake firmware writing handshake + capability +
-// analog-mapping responses sequentially. Returns the constructed board, the
-// arduino-side writer (for further frame injection), and a buffer that
-// captures all bytes the board ever wrote.
+// newConstructorTestBoard builds a *firmataBoard via the same code path
+// production NewBoard uses for post-handshake setup (initializeAnalogs),
+// without going through serial.Open / DTR. The fake firmware writes a
+// canonical handshake + capability + analog-mapping reply.
 //
-// We can't reuse newBoardFromClient here because the goal is to exercise the
-// query path. Instead, we replicate NewBoard's body but skip serial.Open and
-// the DTR dance.
+// Returns the board, the arduino-side writer (for further frame injection),
+// and a buffer capturing every byte the board has written.
 func newConstructorTestBoard(
 	t *testing.T,
 	cfg *Config,
@@ -2242,58 +2313,22 @@ func newConstructorTestBoard(
 	rw := &rwFake{r: arduinoR, w: sentBuf}
 	c := firmata.New(rw)
 
-	// Fake firmware: respond to whatever the board asks for, in order.
 	go func() {
-		// REPORT_VERSION 2.5 (the board's Handshake)
-		_, _ = arduinoW.Write([]byte{0xF9, 0x02, 0x05})
-		// CAPABILITY_RESPONSE
+		_, _ = arduinoW.Write([]byte{0xF9, 0x02, 0x05}) // REPORT_VERSION 2.5
 		_, _ = arduinoW.Write(encodeCapabilityResponseForTest(caps))
-		// ANALOG_MAPPING_RESPONSE
 		_, _ = arduinoW.Write(encodeAnalogMappingResponseForTest(amap))
 	}()
 
 	hsCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-
 	if _, _, err := c.Handshake(hsCtx); err != nil {
 		t.Fatalf("Handshake: %v", err)
-	}
-	gotCaps, err := c.QueryCapabilities(hsCtx)
-	if err != nil {
-		t.Fatalf("QueryCapabilities: %v", err)
-	}
-	gotAmap, err := c.QueryAnalogMapping(hsCtx)
-	if err != nil {
-		t.Fatalf("QueryAnalogMapping: %v", err)
-	}
-
-	if cfg.SamplingIntervalMs > 0 {
-		if err := c.SetSamplingInterval(cfg.SamplingIntervalMs); err != nil {
-			t.Fatalf("SetSamplingInterval: %v", err)
-		}
 	}
 
 	name := board.Named("test")
 	b := newBoardFromClient(name, c, rw, logging.NewTestLogger(t))
-	b.capabilities = gotCaps
-	b.analogMap = gotAmap
-
-	for _, ac := range cfg.Analogs {
-		dpin, ch, err := parseAnalogPin(ac.Pin)
-		if err != nil {
-			t.Fatalf("parseAnalogPin: %v", err)
-		}
-		dpin, ch, err = resolveAnalogPin(dpin, ch, gotAmap)
-		if err != nil {
-			t.Fatalf("resolveAnalogPin(%q): %v", ac.Pin, err)
-		}
-		if !b.pinSupports(dpin, firmata.PinModeAnalog) {
-			t.Fatalf("analog %q: pin %d not analog-capable", ac.Name, dpin)
-		}
-		b.analogs[ac.Name] = &firmataAnalog{
-			board: b, name: ac.Name, digitalPin: dpin, channel: uint8(ch),
-		}
-		b.ownedPins[dpin] = ac.Name
+	if err := b.initializeAnalogs(hsCtx, cfg, logging.NewTestLogger(t)); err != nil {
+		t.Fatalf("initializeAnalogs: %v", err)
 	}
 
 	t.Cleanup(func() {
@@ -2304,22 +2339,16 @@ func newConstructorTestBoard(
 	return b, arduinoW, sentBuf
 }
 
-// encodeCapabilityResponseForTest re-serializes a CapabilityResponse using
-// the wire format. Used only by tests to feed a fake firmware reply.
+// encodeCapabilityResponseForTest re-serializes a CapabilityResponse to its
+// Firmata wire form. Used only by tests to feed a fake firmware reply.
 func encodeCapabilityResponseForTest(cr firmata.CapabilityResponse) []byte {
 	out := []byte{0xF0, 0x6C}
 	for _, p := range cr.Pins {
-		// Iterate in a deterministic order so test diffs are stable.
 		modes := make([]firmata.PinMode, 0, len(p))
 		for m := range p {
 			modes = append(modes, m)
 		}
-		// Simple ascending sort by mode value.
-		for i := 1; i < len(modes); i++ {
-			for j := i; j > 0 && modes[j] < modes[j-1]; j-- {
-				modes[j], modes[j-1] = modes[j-1], modes[j]
-			}
-		}
+		sort.Slice(modes, func(i, j int) bool { return modes[i] < modes[j] })
 		for _, m := range modes {
 			out = append(out, uint8(m), p[m])
 		}
@@ -2336,6 +2365,10 @@ func encodeAnalogMappingResponseForTest(am firmata.AnalogMappingResponse) []byte
 	return out
 }
 
+func encodeSamplingIntervalForTest(ms uint16) []byte {
+	return []byte{0xF0, 0x7A, uint8(ms & 0x7F), uint8((ms >> 7) & 0x7F), 0xF7}
+}
+
 func TestConstructor_EmitsSamplingIntervalWhenConfigured(t *testing.T) {
 	cfg := &Config{
 		SerialPath:         "/dev/null", // unused (we bypass serial.Open)
@@ -2343,16 +2376,10 @@ func TestConstructor_EmitsSamplingIntervalWhenConfigured(t *testing.T) {
 	}
 	_, _, sentBuf := newConstructorTestBoard(t, cfg, unoCaps(), unoAnalogMap())
 
-	// The wire bytes will include the queries plus the sampling-interval sysex.
-	// We just check that a SAMPLING_INTERVAL frame appears.
 	want := encodeSamplingIntervalForTest(50)
 	if !bytes.Contains(sentBuf.Bytes(), want) {
 		t.Errorf("expected SAMPLING_INTERVAL frame % X in % X", want, sentBuf.Bytes())
 	}
-}
-
-func encodeSamplingIntervalForTest(ms uint16) []byte {
-	return []byte{0xF0, 0x7A, uint8(ms & 0x7F), uint8((ms >> 7) & 0x7F), 0xF7}
 }
 
 func TestConstructor_BuildsAnalogReaders(t *testing.T) {
@@ -2371,20 +2398,14 @@ func TestConstructor_BuildsAnalogReaders(t *testing.T) {
 	}
 }
 
-func TestConstructor_RejectsAnalogOnNonAnalogPin(t *testing.T) {
-	// Custom capability: pin 2 supports INPUT/OUTPUT but not analog.
+// TestInitializeAnalogs_RejectsNonAnalogPin asserts the seam itself
+// surfaces a structured error when a declared analog targets a pin without
+// analog capability — exercising the same code path NewBoard uses.
+func TestInitializeAnalogs_RejectsNonAnalogPin(t *testing.T) {
 	caps := firmata.CapabilityResponse{Pins: make([]firmata.PinCapabilities, 4)}
 	caps.Pins[2] = firmata.PinCapabilities{firmata.PinModeOutput: 1}
 	amap := firmata.AnalogMappingResponse{ChannelByPin: []uint8{0x7F, 0x7F, 0x7F, 0x7F}}
 
-	cfg := &Config{
-		SerialPath: "/dev/null",
-		Analogs:    []board.AnalogReaderConfig{{Name: "bad", Pin: "2"}},
-	}
-
-	// We deliberately use a different harness here: the helper above calls
-	// t.Fatalf on resolution failures, so wrap it in a sub-test with a
-	// custom harness that checks for the expected error.
 	arduinoR, arduinoW := io.Pipe()
 	defer arduinoW.Close()
 	sentBuf := &bytes.Buffer{}
@@ -2400,119 +2421,90 @@ func TestConstructor_RejectsAnalogOnNonAnalogPin(t *testing.T) {
 
 	hsCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_, _, _ = c.Handshake(hsCtx)
-	gotCaps, _ := c.QueryCapabilities(hsCtx)
-	gotAmap, _ := c.QueryAnalogMapping(hsCtx)
+	if _, _, err := c.Handshake(hsCtx); err != nil {
+		t.Fatalf("Handshake: %v", err)
+	}
 
-	// Replicate the analog construction loop and assert it errors.
-	for _, ac := range cfg.Analogs {
-		dpin, ch, err := parseAnalogPin(ac.Pin)
-		if err != nil {
-			t.Fatalf("parseAnalogPin: %v", err)
-		}
-		dpin, ch, err = resolveAnalogPin(dpin, ch, gotAmap)
-		if err == nil && len(gotCaps.Pins) > dpin {
-			if _, ok := gotCaps.Pins[dpin][firmata.PinModeAnalog]; !ok {
-				err = fmt.Errorf("pin %d does not support analog", dpin)
-			}
-		}
-		if err == nil {
-			t.Fatalf("expected analog %q to be rejected; got nil", ac.Name)
-		}
-		_ = ch
+	b := newBoardFromClient(board.Named("rej"), c, rw, logging.NewTestLogger(t))
+	cfg := &Config{
+		SerialPath: "/dev/null",
+		Analogs:    []board.AnalogReaderConfig{{Name: "bad", Pin: "2"}},
+	}
+	err := b.initializeAnalogs(hsCtx, cfg, logging.NewTestLogger(t))
+	if err == nil {
+		t.Fatal("expected error rejecting non-analog pin, got nil")
 	}
 }
 ```
 
-- [ ] **Step 2: Run to confirm failure**
+Add `"sort"` to the test file's imports.
 
-Run: `go test -run "TestConstructor" -race`
-Expected: FAIL — most pieces compile, but the SetSamplingInterval may be missing from the helper or `Analogs` go uninitialized.
+- [ ] **Step 4: Run to confirm failure**
 
-- [ ] **Step 3: Update the production `NewBoard` to perform the queries and build analogs**
+Run: `go test -run "TestConstructor|TestInitializeAnalogs" -race`
+Expected: tests run, the helper succeeds — but the production `NewBoard` doesn't yet call `initializeAnalogs`, so it's possible to satisfy the test before updating `NewBoard`. Step 5 closes that.
 
-In `firmata_board.go`, replace the body of `NewBoard` (after the existing handshake) so it:
-1. Runs `QueryCapabilities` and `QueryAnalogMapping` against `hsCtx`.
-2. Optionally calls `SetSamplingInterval`.
-3. Builds the `analogs`/`ownedPins` maps via `parseAnalogPin` + `resolveAnalogPin` + capability check.
+(*If for whatever reason these tests already pass at this point, that's fine — the test harness does call `initializeAnalogs` end-to-end. The Step-5 production edit is what makes `NewBoard` actually viable for real users.*)
+
+- [ ] **Step 5: Wire `initializeAnalogs` into the production `NewBoard`**
+
+In `firmata_board.go`, in `NewBoard`, replace the trailing `return newBoardFromClient(conf.ResourceName(), c, sp, logger), nil` with:
 
 ```go
-// after Handshake succeeds:
-caps, err := c.QueryCapabilities(hsCtx)
-if err != nil {
-	_ = c.Close()
-	_ = sp.Close()
-	return nil, fmt.Errorf("capability query on %s: %w", cfg.SerialPath, err)
-}
-amap, err := c.QueryAnalogMapping(hsCtx)
-if err != nil {
-	_ = c.Close()
-	_ = sp.Close()
-	return nil, fmt.Errorf("analog mapping query on %s: %w", cfg.SerialPath, err)
-}
-
-if cfg.SamplingIntervalMs > 0 {
-	if err := c.SetSamplingInterval(cfg.SamplingIntervalMs); err != nil {
-		_ = c.Close()
-		_ = sp.Close()
-		return nil, fmt.Errorf("set sampling interval on %s: %w", cfg.SerialPath, err)
-	}
-}
-
 b := newBoardFromClient(conf.ResourceName(), c, sp, logger)
-b.capabilities = caps
-b.analogMap = amap
-
-for _, ac := range cfg.Analogs {
-	dpin, ch, err := parseAnalogPin(ac.Pin)
-	if err != nil {
-		_ = b.Close(ctx)
-		return nil, fmt.Errorf("analog %q: %w", ac.Name, err)
-	}
-	dpin, ch, err = resolveAnalogPin(dpin, ch, amap)
-	if err != nil {
-		_ = b.Close(ctx)
-		return nil, fmt.Errorf("analog %q: %w", ac.Name, err)
-	}
-	if !b.pinSupports(dpin, firmata.PinModeAnalog) {
-		_ = b.Close(ctx)
-		return nil, fmt.Errorf("analog %q: pin %d does not support analog mode", ac.Name, dpin)
-	}
-	if ac.SamplesPerSecond != 0 {
-		logger.Warnf("firmata board: analog %q samples_per_sec=%d ignored — Firmata only supports a global sampling_interval_ms",
-			ac.Name, ac.SamplesPerSecond)
-	}
-	b.analogs[ac.Name] = &firmataAnalog{
-		board: b, name: ac.Name, digitalPin: dpin, channel: uint8(ch),
-	}
-	b.ownedPins[dpin] = ac.Name
+if err := b.initializeAnalogs(hsCtx, cfg, logger); err != nil {
+	_ = b.Close(ctx)
+	return nil, fmt.Errorf("init on %s: %w", cfg.SerialPath, err)
 }
-
 return b, nil
 ```
 
-- [ ] **Step 4: Run the new tests**
+`hsCtx` already exists in the function (used by `Handshake`); reuse it so the queries inherit the same `handshake_timeout` budget. Keep `cancel()` placement after the queries return so the context is alive long enough for both — i.e., move `cancel()` from immediately after the existing `Handshake` call down to after the `initializeAnalogs` call. The full revised tail of `NewBoard` looks like:
 
-Run: `go test -run TestConstructor -race`
-Expected: PASS.
+```go
+hsCtx, cancel := context.WithTimeout(ctx, hsTimeout)
+defer cancel()
+major, minor, err := c.Handshake(hsCtx)
+if err != nil {
+	_ = c.Close()
+	_ = sp.Close()
+	return nil, fmt.Errorf("handshake on %s: %w", cfg.SerialPath, err)
+}
+logger.Infof("firmata board: connected to %s — firmware v%d.%d", cfg.SerialPath, major, minor)
 
-- [ ] **Step 5: Run the whole suite (still expecting the v1 unimplemented-error test to regress)**
+b := newBoardFromClient(conf.ResourceName(), c, sp, logger)
+if err := b.initializeAnalogs(hsCtx, cfg, logger); err != nil {
+	_ = b.Close(ctx)
+	return nil, fmt.Errorf("init on %s: %w", cfg.SerialPath, err)
+}
+return b, nil
+```
+
+(Note: the existing `cancel()` was called inline; the revised version uses `defer cancel()` so it spans both the handshake and the initialize phase.)
+
+- [ ] **Step 6: Run the new tests**
+
+Run: `go test -run "TestConstructor|TestInitializeAnalogs" -race`
+Expected: PASS — both the helper-driven tests and the explicit seam test are green, and the production `NewBoard` now goes through the same code path.
+
+- [ ] **Step 7: Run the whole suite**
 
 Run: `go test -race ./...`
-Expected: only `TestUnimplementedMethods_ReturnSentinelError` fails (we'll fix it next).
+Expected: only `TestUnimplementedMethods_ReturnSentinelError` fails (Task 17 fixes it). The constructor edits don't regress the existing v1 GPIO tests because `newTestBoard` still uses `newBoardFromClient` directly — it doesn't go through `initializeAnalogs`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add firmata_board.go firmata_board_test.go
 git commit -m "$(cat <<'EOF'
-feat(board): NewBoard issues capability + analog-mapping queries, builds analogs
+feat(board): initializeAnalogs seam + NewBoard wires capability + analog mapping
 
-After Handshake, the constructor sends CAPABILITY_QUERY and
-ANALOG_MAPPING_QUERY (both bounded by the existing handshake_timeout),
-optionally SAMPLING_INTERVAL, then resolves each analogs[] entry against
-the firmware's analog map and capability table. Capability mismatches are
-surfaced as construction errors with the resource cleanly closed.
+Extracts post-handshake setup (CAPABILITY_QUERY, ANALOG_MAPPING_QUERY,
+optional SAMPLING_INTERVAL, analogs[] resolution against firmware caps)
+into firmataBoard.initializeAnalogs. Both NewBoard and the test harness
+call this single seam, so tests genuinely gate the production path.
+NewBoard reuses the same hsCtx as Handshake, so the queries inherit
+handshake_timeout. Failures during init close the resource cleanly.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -2736,6 +2728,68 @@ Updates the scope section now that v2 ships analog + PWM, adds an
 "Analog readers" section with config schema and an explanation of pin
 ownership, documents the fixed-PWM-frequency caveat, and links the new
 spec/plan from the bottom-of-page index.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+## Task 19: `meta.json` — refresh model description
+
+**Files:**
+- Modify: `/Users/nick.hehr/src/viam-firmata/meta.json`
+
+`meta.json` has no `version` field — registry versions are derived from git tags via the existing `viamrobotics/build-action@v1` workflow. So "version bump" happens at tag time. What does need updating now is the `description` and `models[0].short_description`, both of which still claim v1's digital-GPIO-only scope.
+
+- [ ] **Step 1: Update the descriptions**
+
+In `meta.json`, change:
+
+```json
+  "description": "Firmata-over-serial board component for Arduino / ConfigurableFirmata devices.",
+```
+
+to:
+
+```json
+  "description": "Firmata-over-serial board component for Arduino / ConfigurableFirmata devices: digital GPIO, analog reads, and PWM.",
+```
+
+And change:
+
+```json
+      "short_description": "Digital GPIO via ConfigurableFirmata over USB serial.",
+```
+
+to:
+
+```json
+      "short_description": "Digital GPIO, analog reads, and PWM via ConfigurableFirmata over USB serial.",
+```
+
+Leave every other field exactly as-is.
+
+- [ ] **Step 2: Verify the file is still valid JSON**
+
+Run: `python3 -m json.tool meta.json > /dev/null`
+Expected: no output, no error. (Or use `jq . meta.json > /dev/null` if `jq` is available.)
+
+- [ ] **Step 3: Run the suite (sanity)**
+
+Run: `go test -race ./...`
+Expected: PASS — `meta.json` is not consumed by any test, but a green run confirms nothing else has drifted.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add meta.json
+git commit -m "$(cat <<'EOF'
+chore(meta): refresh module description for analog + PWM
+
+The module now exposes analog reads and PWM in addition to digital GPIO.
+Registry version itself is bumped via the next git tag, not via meta.json.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
