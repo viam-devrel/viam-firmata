@@ -17,7 +17,12 @@
     "setup": "./setup.sh",
     "build": "./build.sh",
     "path": "module.tar.gz",
-    "arch": ["linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64"]
+    "arch": [
+      "linux/amd64",
+      "linux/arm64",
+      "windows/amd64",
+      "darwin/arm64"
+    ]
   },
   "markdown_link": "README.md"
 }
