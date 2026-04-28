@@ -91,7 +91,7 @@ type AnalogMappingResponse struct {
 `decode` grows two new branches:
 
 - `cmd&0xF0 == cmdAnalogMessage` returns `AnalogMessage` with the same two-7-bit-byte assembly used for digital-port masks.
-- The existing `cmdStartSysex` branch is upgraded from "always returns `UnknownMessage`" to switching on the first sysex byte: `sysexCapabilityResponse` → decode into `CapabilityResponse`; `sysexAnalogMappingResponse` → decode into `AnalogMappingResponse`. Anything else still falls through to `UnknownMessage` (the existing fallback path remains as-is in `readLoop`'s switch), so unknown sysex is gracefully ignored.
+- The existing `cmdStartSysex` branch is upgraded from "always returns `UnknownMessage`" to switching on the first sysex byte: `sysexCapabilityResponse` → decode into `CapabilityResponse`; `sysexAnalogMappingResponse` → decode into `AnalogMappingResponse`. Anything else still falls through to `UnknownMessage`, so unknown sysex is gracefully ignored.
 
 ### 3.2 `internal/firmata/client.go` additions
 
@@ -116,9 +116,9 @@ func (c *Client) AnalogWrite(pin int, value uint16) error
 // pin <16 → ANALOG_MESSAGE; pin ≥16 → EXTENDED_ANALOG sysex.
 // value masked to the 14-bit Firmata range.
 
-func (c *Client) EnableAnalogReporting(channel int, enable bool) error // parallels existing EnableDigitalReporting(port, enable); arg is an analog channel index, not a port
-func (c *Client) SetSamplingInterval(intervalMs int) error              // 1..16383ms; clamped at boundaries
-func (c *Client) ReadAnalog(channel int) uint16                         // mirrors ReadDigital
+func (c *Client) EnableAnalogReporting(channel int, enable bool) error
+func (c *Client) SetSamplingInterval(intervalMs int) error // 1..16383ms; clamped at boundaries
+func (c *Client) ReadAnalog(channel int) uint16            // mirrors ReadDigital
 
 func (c *Client) QueryCapabilities(ctx context.Context) (CapabilityResponse, error)
 func (c *Client) QueryAnalogMapping(ctx context.Context) (AnalogMappingResponse, error)
@@ -168,13 +168,11 @@ func (c *Config) Validate(path string) ([]string, []string, error) {
     return nil, nil, nil
 }
 
-// parseAnalogPin accepts "A0".."A15" or a raw digital pin number "0".."127".
-// The unknown side of the pair is returned as the sentinel -1 — resolveAnalogPin
-// (called in the constructor against the analog-mapping response) fills it in.
-// Capability validation against analog support also happens in the constructor.
-//
-//   "A3"  → (digitalPin: -1, analogChannel: 3)
-//   "14"  → (digitalPin: 14, analogChannel: -1)
+// parseAnalogPin accepts "A0".."A15" (returns analog-channel form, digitalPin
+// resolved later from the analog-mapping response) or a raw digital pin
+// number "0".."127" (returns digital-pin form, channel resolved from the
+// analog-mapping response). Capability validation against analog support
+// happens in the constructor.
 func parseAnalogPin(s string) (digitalPin int, analogChannel int, err error) { /* ... */ }
 ```
 
@@ -213,9 +211,6 @@ func (a *firmataAnalog) Read(ctx context.Context, _ map[string]any) (board.Analo
         a.board.pinModes[a.digitalPin] = firmata.PinModeAnalog
         a.board.mu.Unlock()
     })
-    // enableErr is set once inside enableOnce.Do and never cleared, so subsequent
-    // Reads return the same cached error rather than retrying mid-traffic.
-    // (See §5 error table.)
     if errp := a.enableErr.Load(); errp != nil {
         return board.AnalogValue{}, *errp
     }
