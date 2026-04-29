@@ -16,27 +16,31 @@ type PinChange struct {
 }
 
 type Client struct {
-	rw          io.ReadWriteCloser
-	br          *bufio.Reader
-	portState   [16]uint8  // last-known input mask per port
-	outState    [16]uint8  // last-written output mask per port
-	analogState [16]uint16 // last-known value per analog channel
-	events      chan PinChange
-	version     chan VersionMessage
-	readErr     atomic.Pointer[error]
-	readerDone  chan struct{}
-	writeMu     sync.Mutex
-	stateMu     sync.RWMutex // guards portState for external readers
-	closed      atomic.Bool
+	rw           io.ReadWriteCloser
+	br           *bufio.Reader
+	portState    [16]uint8  // last-known input mask per port
+	outState     [16]uint8  // last-written output mask per port
+	analogState  [16]uint16 // last-known value per analog channel
+	events       chan PinChange
+	version      chan VersionMessage
+	capabilities chan CapabilityResponse
+	analogMap    chan AnalogMappingResponse
+	readErr      atomic.Pointer[error]
+	readerDone   chan struct{}
+	writeMu      sync.Mutex
+	stateMu      sync.RWMutex // guards portState for external readers
+	closed       atomic.Bool
 }
 
 func New(rw io.ReadWriteCloser) *Client {
 	c := &Client{
-		rw:         rw,
-		br:         bufio.NewReader(rw),
-		events:     make(chan PinChange, 16),
-		version:    make(chan VersionMessage, 1),
-		readerDone: make(chan struct{}),
+		rw:           rw,
+		br:           bufio.NewReader(rw),
+		events:       make(chan PinChange, 16),
+		version:      make(chan VersionMessage, 1),
+		capabilities: make(chan CapabilityResponse, 1),
+		analogMap:    make(chan AnalogMappingResponse, 1),
+		readerDone:   make(chan struct{}),
 	}
 	go c.readLoop()
 	return c
@@ -75,6 +79,16 @@ func (c *Client) readLoop() {
 			// Non-blocking send: if nobody is waiting we drop it.
 			select {
 			case c.version <- m:
+			default:
+			}
+		case CapabilityResponse:
+			select {
+			case c.capabilities <- m:
+			default:
+			}
+		case AnalogMappingResponse:
+			select {
+			case c.analogMap <- m:
 			default:
 			}
 		case DigitalPortMessage:
@@ -120,6 +134,31 @@ func (c *Client) Handshake(ctx context.Context) (major, minor uint8, err error) 
 		return v.Major, v.Minor, nil
 	case <-ctx.Done():
 		return 0, 0, fmt.Errorf("handshake: %w (no REPORT_VERSION received — wrong port or baud?)", ctx.Err())
+	}
+}
+
+// QueryCapabilities sends a CAPABILITY_QUERY and waits for the matching
+// response. Same shape as Handshake — the query is written from a goroutine
+// so io.Pipe-based tests don't deadlock.
+func (c *Client) QueryCapabilities(ctx context.Context) (CapabilityResponse, error) {
+	go func() { _ = c.writeFrame(encodeCapabilityQuery()) }()
+	select {
+	case r := <-c.capabilities:
+		return r, nil
+	case <-ctx.Done():
+		return CapabilityResponse{}, fmt.Errorf("capability query: %w (no CAPABILITY_RESPONSE — is StandardFirmataPlus or ConfigurableFirmata flashed?)", ctx.Err())
+	}
+}
+
+// QueryAnalogMapping sends an ANALOG_MAPPING_QUERY and waits for the matching
+// response.
+func (c *Client) QueryAnalogMapping(ctx context.Context) (AnalogMappingResponse, error) {
+	go func() { _ = c.writeFrame(encodeAnalogMappingQuery()) }()
+	select {
+	case r := <-c.analogMap:
+		return r, nil
+	case <-ctx.Done():
+		return AnalogMappingResponse{}, fmt.Errorf("analog mapping query: %w (no ANALOG_MAPPING_RESPONSE)", ctx.Err())
 	}
 }
 

@@ -380,6 +380,74 @@ func TestSetSamplingInterval_OutOfRange(t *testing.T) {
 	}
 }
 
+func TestQueryCapabilities_Succeeds(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	// Fake board responds with a 2-pin capability payload.
+	go func() {
+		_, _ = pp.board.Write([]byte{
+			0xF0, 0x6C,
+			0x00, 0x01, 0x01, 0x01, 0x7F, // pin 0: INPUT(1), OUTPUT(1)
+			0x03, 0x08, 0x7F, // pin 1: PWM(8)
+			0xF7,
+		})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cr, err := c.QueryCapabilities(ctx)
+	if err != nil {
+		t.Fatalf("QueryCapabilities: %v", err)
+	}
+	if len(cr.Pins) != 2 {
+		t.Fatalf("len(Pins) = %d, want 2", len(cr.Pins))
+	}
+	if cr.Pins[1][PinModePWM] != 8 {
+		t.Errorf("pin 1 PWM resolution = %d, want 8", cr.Pins[1][PinModePWM])
+	}
+}
+
+func TestQueryCapabilities_TimesOut(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	// Drain the outbound query bytes so the writer doesn't block forever.
+	go func() {
+		buf := make([]byte, 64)
+		_, _ = pp.board.Read(buf)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := c.QueryCapabilities(ctx); err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+}
+
+func TestQueryAnalogMapping_Succeeds(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	go func() {
+		_, _ = pp.board.Write([]byte{0xF0, 0x6A, 0x7F, 0x7F, 0x00, 0x01, 0xF7})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	am, err := c.QueryAnalogMapping(ctx)
+	if err != nil {
+		t.Fatalf("QueryAnalogMapping: %v", err)
+	}
+	want := []uint8{0x7F, 0x7F, 0x00, 0x01}
+	if !bytes.Equal(am.ChannelByPin, want) {
+		t.Errorf("got % X, want % X", am.ChannelByPin, want)
+	}
+}
+
 type rwAdapter struct {
 	r io.ReadCloser
 	w io.WriteCloser
