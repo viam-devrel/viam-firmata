@@ -10,6 +10,7 @@ import (
 	"io"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.bug.st/serial"
@@ -97,6 +98,20 @@ type firmataBoard struct {
 	// finer-grained concurrency if this becomes a bottleneck.
 	mu       sync.Mutex
 	pinModes map[int]firmata.PinMode
+
+	// Capability data populated in NewBoard right after handshake.
+	capabilities firmata.CapabilityResponse
+	analogMap    firmata.AnalogMappingResponse
+
+	// analogs is the set of declared analog readers, keyed by their config
+	// name. ownedPins maps each digital pin used by a declared analog back
+	// to that analog's name so GPIOPinByName(...).Set/Get can refuse it.
+	analogs   map[string]*firmataAnalog
+	ownedPins map[int]string
+
+	// pwmDuty is the last duty value written to each pin via SetPWM. Read
+	// back by PWM(). Guarded by mu.
+	pwmDuty map[int]float64
 }
 
 // newBoardFromClient wires a *firmata.Client (and the io.Closer that owns the
@@ -111,6 +126,9 @@ func newBoardFromClient(name resource.Name, c *firmata.Client, closer io.Closer,
 		client:    c,
 		drainDone: make(chan struct{}),
 		pinModes:  make(map[int]firmata.PinMode),
+		analogs:   map[string]*firmataAnalog{},
+		ownedPins: map[int]string{},
+		pwmDuty:   map[int]float64{},
 	}
 	go b.drainEvents()
 	return b
@@ -312,6 +330,32 @@ func parseAnalogPin(s string) (digitalPin int, analogChannel int, err error) {
 		return -1, -1, fmt.Errorf("invalid analog pin %q (want \"A0\".. \"A15\" or 0..127)", s)
 	}
 	return n, -1, nil
+}
+
+// firmataAnalog implements board.Analog over a firmata.Client. Lazily
+// configures the pin and enables reporting on first Read; subsequent reads
+// return the cached value from Client.analogState.
+type firmataAnalog struct {
+	board      *firmataBoard
+	name       string
+	digitalPin int
+	channel    uint8
+	enableOnce sync.Once
+	enableErr  atomic.Pointer[error]
+}
+
+// pinSupports reports whether the firmware advertises the given mode for
+// the pin. Returns false if the pin is out of the capability map or the
+// capability table is empty (e.g. before handshake-time discovery has
+// populated it; tests that bypass NewBoard need to inject capabilities
+// explicitly).
+func (b *firmataBoard) pinSupports(pin int, mode firmata.PinMode) bool {
+	if pin < 0 || pin >= len(b.capabilities.Pins) {
+		return false
+	}
+	caps := b.capabilities.Pins[pin]
+	_, ok := caps[mode]
+	return ok
 }
 
 // Compile-time assertions that our types satisfy the full board interfaces.
