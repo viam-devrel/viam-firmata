@@ -158,6 +158,37 @@ func TestDecode_SysexOverflowErrors(t *testing.T) {
 	}
 }
 
+func TestEncodeAnalogWrite(t *testing.T) {
+	// ANALOG_MESSAGE for channel 6, value 200:
+	//   cmd = 0xE0 | 6 = 0xE6
+	//   lsb = 200 & 0x7F = 0x48
+	//   msb = (200 >> 7) & 0x7F = 0x01
+	got := encodeAnalogWrite(6, 200)
+	want := []byte{0xE6, 0x48, 0x01}
+	if !bytes.Equal(got, want) {
+		t.Errorf("encodeAnalogWrite(6, 200): got % X, want % X", got, want)
+	}
+}
+
+func TestEncodeExtendedAnalog(t *testing.T) {
+	// EXTENDED_ANALOG for pin 20, value 200:
+	//   0xF0 0x6F pin lsb msb 0xF7
+	got := encodeExtendedAnalog(20, 200)
+	want := []byte{0xF0, 0x6F, 20, 0x48, 0x01, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("encodeExtendedAnalog(20, 200): got % X, want % X", got, want)
+	}
+}
+
+func TestEncodeExtendedAnalog_HighResolution(t *testing.T) {
+	// 14-bit value 0x3FFF should serialize to two 7-bit bytes 0x7F, 0x7F.
+	got := encodeExtendedAnalog(20, 0x3FFF)
+	want := []byte{0xF0, 0x6F, 20, 0x7F, 0x7F, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("encodeExtendedAnalog(20, 0x3FFF): got % X, want % X", got, want)
+	}
+}
+
 func TestNewMessageTypes_ZeroValues(t *testing.T) {
 	var am AnalogMessage
 	if am.Channel != 0 || am.Value != 0 {

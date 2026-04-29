@@ -58,6 +58,31 @@ func encodeDigitalPortWrite(port, mask uint8) []byte {
 	return []byte{cmdDigitalMessage | (port & 0x0F), mask & 0x7F, (mask >> 7) & 0x01}
 }
 
+// encodeAnalogWrite emits an ANALOG_MESSAGE for analog channels 0..15.
+// Value is masked to 14 bits and split across two 7-bit data bytes.
+func encodeAnalogWrite(channel uint8, value uint16) []byte {
+	value &= 0x3FFF
+	return []byte{
+		cmdAnalogMessage | (channel & 0x0F),
+		uint8(value & 0x7F),
+		uint8((value >> 7) & 0x7F),
+	}
+}
+
+// encodeExtendedAnalog emits a sysex EXTENDED_ANALOG for pins/channels >15.
+// Value is masked to 14 bits and split across two 7-bit data bytes.
+func encodeExtendedAnalog(pin uint8, value uint16) []byte {
+	value &= 0x3FFF
+	return []byte{
+		cmdStartSysex,
+		sysexExtendedAnalog,
+		pin & 0x7F,
+		uint8(value & 0x7F),
+		uint8((value >> 7) & 0x7F),
+		cmdEndSysex,
+	}
+}
+
 func encodeReportDigital(port uint8, enable bool) []byte {
 	var b uint8
 	if enable {
