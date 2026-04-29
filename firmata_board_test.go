@@ -227,14 +227,9 @@ func TestUnimplementedMethods_ReturnSentinelError(t *testing.T) {
 	defer tb.cleanup()
 	ctx := context.Background()
 
-	// GPIOPin PWM family.
+	// PWM frequency control is genuinely unimplemented — Firmata has no
+	// runtime-frequency wire spec.
 	pin, _ := tb.b.GPIOPinByName("5")
-	if _, err := pin.PWM(ctx, nil); !errors.Is(err, errUnimplemented) {
-		t.Errorf("PWM: want errUnimplemented, got %v", err)
-	}
-	if err := pin.SetPWM(ctx, 0.5, nil); !errors.Is(err, errUnimplemented) {
-		t.Errorf("SetPWM: want errUnimplemented, got %v", err)
-	}
 	if _, err := pin.PWMFreq(ctx, nil); !errors.Is(err, errUnimplemented) {
 		t.Errorf("PWMFreq: want errUnimplemented, got %v", err)
 	}
@@ -242,13 +237,12 @@ func TestUnimplementedMethods_ReturnSentinelError(t *testing.T) {
 		t.Errorf("SetPWMFreq: want errUnimplemented, got %v", err)
 	}
 
-	// Board-level.
-	if _, err := tb.b.AnalogByName("a0"); !errors.Is(err, errUnimplemented) {
-		t.Errorf("AnalogByName: want errUnimplemented, got %v", err)
-	}
+	// Digital interrupts ship in a separate spec; today they remain unimplemented.
 	if _, err := tb.b.DigitalInterruptByName("d0"); !errors.Is(err, errUnimplemented) {
 		t.Errorf("DigitalInterruptByName: want errUnimplemented, got %v", err)
 	}
+
+	// SetPowerMode and StreamTicks remain explicit non-goals.
 	if err := tb.b.SetPowerMode(ctx, 0, nil, nil); !errors.Is(err, errUnimplemented) {
 		t.Errorf("SetPowerMode: want errUnimplemented, got %v", err)
 	}
