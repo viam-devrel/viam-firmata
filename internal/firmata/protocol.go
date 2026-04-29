@@ -91,6 +91,35 @@ func encodeReportDigital(port uint8, enable bool) []byte {
 	return []byte{cmdReportDigital | (port & 0x0F), b}
 }
 
+func encodeReportAnalog(channel uint8, enable bool) []byte {
+	var b uint8
+	if enable {
+		b = 1
+	}
+	return []byte{cmdReportAnalog | (channel & 0x0F), b}
+}
+
+// encodeSamplingInterval emits a SAMPLING_INTERVAL sysex. Caller is
+// responsible for ensuring intervalMs fits in 14 bits (1..16383).
+func encodeSamplingInterval(intervalMs uint16) []byte {
+	intervalMs &= 0x3FFF
+	return []byte{
+		cmdStartSysex,
+		sysexSamplingInterval,
+		uint8(intervalMs & 0x7F),
+		uint8((intervalMs >> 7) & 0x7F),
+		cmdEndSysex,
+	}
+}
+
+func encodeCapabilityQuery() []byte {
+	return []byte{cmdStartSysex, sysexCapabilityQuery, cmdEndSysex}
+}
+
+func encodeAnalogMappingQuery() []byte {
+	return []byte{cmdStartSysex, sysexAnalogMappingQuery, cmdEndSysex}
+}
+
 // Message is a decoded Firmata frame. Concrete types below.
 type Message interface{ isMessage() }
 

@@ -189,6 +189,57 @@ func TestEncodeExtendedAnalog_HighResolution(t *testing.T) {
 	}
 }
 
+func TestEncodeReportAnalog(t *testing.T) {
+	tests := []struct {
+		name string
+		got  []byte
+		want []byte
+	}{
+		{"channel 0 enable", encodeReportAnalog(0, true), []byte{0xC0, 0x01}},
+		{"channel 5 enable", encodeReportAnalog(5, true), []byte{0xC5, 0x01}},
+		{"channel 0 disable", encodeReportAnalog(0, false), []byte{0xC0, 0x00}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !bytes.Equal(tc.got, tc.want) {
+				t.Errorf("got % X, want % X", tc.got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEncodeSamplingInterval(t *testing.T) {
+	// 100ms -> lsb=0x64, msb=0x00. Frame: F0 7A 64 00 F7.
+	got := encodeSamplingInterval(100)
+	want := []byte{0xF0, 0x7A, 0x64, 0x00, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("encodeSamplingInterval(100): got % X, want % X", got, want)
+	}
+
+	// 1000ms -> 0x03E8. lsb=0x68, msb=0x07.
+	got = encodeSamplingInterval(1000)
+	want = []byte{0xF0, 0x7A, 0x68, 0x07, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("encodeSamplingInterval(1000): got % X, want % X", got, want)
+	}
+}
+
+func TestEncodeCapabilityQuery(t *testing.T) {
+	got := encodeCapabilityQuery()
+	want := []byte{0xF0, 0x6B, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+}
+
+func TestEncodeAnalogMappingQuery(t *testing.T) {
+	got := encodeAnalogMappingQuery()
+	want := []byte{0xF0, 0x69, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+}
+
 func TestNewMessageTypes_ZeroValues(t *testing.T) {
 	var am AnalogMessage
 	if am.Channel != 0 || am.Value != 0 {
