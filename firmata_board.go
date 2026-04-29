@@ -214,14 +214,33 @@ func (p *firmataGPIOPin) Get(_ context.Context, _ map[string]any) (bool, error) 
 	return p.board.client.ReadDigital(p.pin), nil
 }
 
-// PWM is intentionally unimplemented in v1; PWM support is out of scope.
-func (p *firmataGPIOPin) PWM(_ context.Context, _ map[string]any) (float64, error) {
-	return 0, errUnimplemented
+func (p *firmataGPIOPin) SetPWM(_ context.Context, dutyCyclePct float64, _ map[string]any) error {
+	if owner, taken := p.board.ownedPins[p.pin]; taken {
+		return fmt.Errorf("firmata board: pin %d is owned by analog %q", p.pin, owner)
+	}
+	duty, err := board.ValidatePWMDutyCycle(dutyCyclePct)
+	if err != nil {
+		return err
+	}
+	if !p.board.pinSupports(p.pin, firmata.PinModePWM) {
+		return fmt.Errorf("firmata board: pin %d does not support PWM", p.pin)
+	}
+	if err := p.ensureMode(firmata.PinModePWM); err != nil {
+		return err
+	}
+	if err := p.board.client.AnalogWrite(p.pin, uint16(duty*255)); err != nil {
+		return err
+	}
+	p.board.mu.Lock()
+	p.board.pwmDuty[p.pin] = duty
+	p.board.mu.Unlock()
+	return nil
 }
 
-// SetPWM is intentionally unimplemented in v1; PWM support is out of scope.
-func (p *firmataGPIOPin) SetPWM(_ context.Context, _ float64, _ map[string]any) error {
-	return errUnimplemented
+func (p *firmataGPIOPin) PWM(_ context.Context, _ map[string]any) (float64, error) {
+	p.board.mu.Lock()
+	defer p.board.mu.Unlock()
+	return p.board.pwmDuty[p.pin], nil
 }
 
 // PWMFreq is intentionally unimplemented in v1; PWM support is out of scope.

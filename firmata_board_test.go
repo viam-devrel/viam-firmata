@@ -544,6 +544,96 @@ func TestGPIOPin_Set_UnaffectedWhenAnotherPinIsOwned(t *testing.T) {
 	}
 }
 
+func TestSetPWM_OnPWMCapablePin_EmitsModeAndAnalogMessage(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(), nil)
+	defer tb.cleanup()
+
+	pin, err := tb.b.GPIOPinByName("9") // PWM-capable on Uno
+	if err != nil {
+		t.Fatalf("GPIOPinByName: %v", err)
+	}
+	if err := pin.SetPWM(context.Background(), 0.5, nil); err != nil {
+		t.Fatalf("SetPWM: %v", err)
+	}
+
+	// SET_PIN_MODE(9, PWM=0x03) + ANALOG_MESSAGE channel 9, value 127.
+	// 0.5 * 255 = 127.5 -> 127 after uint16 truncation.
+	want := []byte{
+		0xF4, 0x09, 0x03,
+		0xE9, 0x7F, 0x00,
+	}
+	if got := tb.sentBuf.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+
+	// PWM() returns the cached duty.
+	got, err := pin.PWM(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("PWM: %v", err)
+	}
+	if got != 0.5 {
+		t.Errorf("PWM cached = %v, want 0.5", got)
+	}
+}
+
+func TestSetPWM_OnNonPWMPin_RejectsWithoutWire(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(), nil)
+	defer tb.cleanup()
+
+	pin, _ := tb.b.GPIOPinByName("2") // NOT PWM-capable on Uno
+	err := pin.SetPWM(context.Background(), 0.5, nil)
+	if err == nil {
+		t.Fatal("SetPWM on non-PWM pin: want error, got nil")
+	}
+	if got := tb.sentBuf.Len(); got != 0 {
+		t.Errorf("emitted %d bytes; want zero", got)
+	}
+}
+
+func TestSetPWM_HighPin_EmitsExtendedAnalog(t *testing.T) {
+	// Synthetic ESP32-shape capability: pin 20 is PWM-capable.
+	caps := firmata.CapabilityResponse{Pins: make([]firmata.PinCapabilities, 32)}
+	caps.Pins[20] = firmata.PinCapabilities{
+		firmata.PinModeOutput: 1,
+		firmata.PinModePWM:    8,
+	}
+	amap := firmata.AnalogMappingResponse{ChannelByPin: make([]uint8, 32)}
+	for i := range amap.ChannelByPin {
+		amap.ChannelByPin[i] = 0x7F
+	}
+
+	tb := newTestBoardWithCaps(t, caps, amap, nil)
+	defer tb.cleanup()
+
+	pin, _ := tb.b.GPIOPinByName("20")
+	if err := pin.SetPWM(context.Background(), 0.5, nil); err != nil {
+		t.Fatalf("SetPWM: %v", err)
+	}
+
+	// SET_PIN_MODE(20, PWM) + EXTENDED_ANALOG sysex.
+	want := []byte{
+		0xF4, 20, 0x03,
+		0xF0, 0x6F, 20, 0x7F, 0x00, 0xF7, // value 127 = 0x7F lsb, 0x00 msb
+	}
+	if got := tb.sentBuf.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+}
+
+func TestPWM_DefaultsToZero(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(), nil)
+	defer tb.cleanup()
+
+	pin, _ := tb.b.GPIOPinByName("9")
+	got, err := pin.PWM(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("PWM: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("PWM before any SetPWM = %v, want 0", got)
+	}
+}
+
 func TestSet_AfterStreamClose_ReturnsError(t *testing.T) {
 	tb := newTestBoard(t)
 	defer tb.cleanup()
