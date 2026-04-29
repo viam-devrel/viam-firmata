@@ -3,12 +3,12 @@
   "module_id": "devrel:firmata",
   "visibility": "public",
   "url": "https://github.com/viam-devrel/viam-firmata",
-  "description": "Firmata-over-serial board component for Arduino / ConfigurableFirmata devices.",
+  "description": "Firmata-over-serial board component for Arduino / ConfigurableFirmata devices: digital GPIO, analog reads, and PWM.",
   "models": [
     {
       "api": "rdk:component:board",
       "model": "devrel:firmata:board",
-      "short_description": "Digital GPIO via ConfigurableFirmata over USB serial.",
+      "short_description": "Digital GPIO, analog reads, and PWM via ConfigurableFirmata over USB serial.",
       "markdown_link": "README.md#model-devrelfirmataboard"
     }
   ],
