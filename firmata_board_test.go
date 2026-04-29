@@ -243,6 +243,82 @@ func TestGPIOPinByName_RejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_Analogs(t *testing.T) {
+	t.Run("accepts well-formed analogs", func(t *testing.T) {
+		c := &Config{
+			SerialPath: "/dev/null",
+			Analogs: []board.AnalogReaderConfig{
+				{Name: "joy_x", Pin: "A0"},
+				{Name: "joy_y", Pin: "15"},
+			},
+		}
+		if _, _, err := c.Validate("components.0"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("rejects duplicate analog name", func(t *testing.T) {
+		c := &Config{
+			SerialPath: "/dev/null",
+			Analogs: []board.AnalogReaderConfig{
+				{Name: "joy", Pin: "A0"},
+				{Name: "joy", Pin: "A1"},
+			},
+		}
+		if _, _, err := c.Validate("components.0"); err == nil {
+			t.Fatal("expected error for duplicate analog name")
+		}
+	})
+
+	t.Run("rejects duplicate analog pin literal", func(t *testing.T) {
+		c := &Config{
+			SerialPath: "/dev/null",
+			Analogs: []board.AnalogReaderConfig{
+				{Name: "x", Pin: "A0"},
+				{Name: "y", Pin: "A0"},
+			},
+		}
+		if _, _, err := c.Validate("components.0"); err == nil {
+			t.Fatal("expected error for duplicate analog pin")
+		}
+	})
+
+	t.Run("rejects malformed pin string", func(t *testing.T) {
+		c := &Config{
+			SerialPath: "/dev/null",
+			Analogs: []board.AnalogReaderConfig{
+				{Name: "bad", Pin: "Z9"},
+			},
+		}
+		if _, _, err := c.Validate("components.0"); err == nil {
+			t.Fatal("expected error for malformed pin")
+		}
+	})
+
+	t.Run("rejects empty pin", func(t *testing.T) {
+		c := &Config{
+			SerialPath: "/dev/null",
+			Analogs: []board.AnalogReaderConfig{
+				{Name: "bad", Pin: ""},
+			},
+		}
+		if _, _, err := c.Validate("components.0"); err == nil {
+			t.Fatal("expected error for empty pin")
+		}
+	})
+
+	t.Run("rejects sampling_interval_ms out of range", func(t *testing.T) {
+		c := &Config{SerialPath: "/dev/null", SamplingIntervalMs: -1}
+		if _, _, err := c.Validate("components.0"); err == nil {
+			t.Fatal("expected error for negative sampling_interval_ms")
+		}
+		c = &Config{SerialPath: "/dev/null", SamplingIntervalMs: 16384}
+		if _, _, err := c.Validate("components.0"); err == nil {
+			t.Fatal("expected error for sampling_interval_ms > 16383")
+		}
+	})
+}
+
 func TestSet_AfterStreamClose_ReturnsError(t *testing.T) {
 	tb := newTestBoard(t)
 	defer tb.cleanup()

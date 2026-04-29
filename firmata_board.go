@@ -30,10 +30,12 @@ var errUnimplemented = errors.New("firmata board: method not implemented")
 
 // Config is the attributes block for a devrel:firmata:board component.
 type Config struct {
-	SerialPath       string        `json:"serial_path"`
-	BaudRate         int           `json:"baud_rate,omitempty"`
-	AutoResetDelay   time.Duration `json:"auto_reset_delay,omitempty"`
-	HandshakeTimeout time.Duration `json:"handshake_timeout,omitempty"`
+	SerialPath         string                     `json:"serial_path"`
+	BaudRate           int                        `json:"baud_rate,omitempty"`
+	AutoResetDelay     time.Duration              `json:"auto_reset_delay,omitempty"`
+	HandshakeTimeout   time.Duration              `json:"handshake_timeout,omitempty"`
+	SamplingIntervalMs int                        `json:"sampling_interval_ms,omitempty"`
+	Analogs            []board.AnalogReaderConfig `json:"analogs,omitempty"`
 }
 
 // Validate checks required fields and reports that this board has no resource
@@ -45,6 +47,32 @@ func (c *Config) Validate(path string) ([]string, []string, error) {
 	if c.BaudRate < 0 {
 		return nil, nil, resource.NewConfigValidationError(path,
 			fmt.Errorf("baud_rate must be >= 0"))
+	}
+	if c.SamplingIntervalMs < 0 || c.SamplingIntervalMs > 16383 {
+		return nil, nil, resource.NewConfigValidationError(path,
+			fmt.Errorf("sampling_interval_ms must be 0..16383"))
+	}
+
+	seenName := map[string]bool{}
+	seenPin := map[string]bool{}
+	for i, a := range c.Analogs {
+		sub := fmt.Sprintf("%s.analogs.%d", path, i)
+		if err := a.Validate(sub); err != nil {
+			return nil, nil, err
+		}
+		if seenName[a.Name] {
+			return nil, nil, resource.NewConfigValidationError(sub,
+				fmt.Errorf("duplicate analog name %q", a.Name))
+		}
+		if seenPin[a.Pin] {
+			return nil, nil, resource.NewConfigValidationError(sub,
+				fmt.Errorf("pin %q declared in multiple analogs entries", a.Pin))
+		}
+		if _, _, err := parseAnalogPin(a.Pin); err != nil {
+			return nil, nil, resource.NewConfigValidationError(sub, err)
+		}
+		seenName[a.Name] = true
+		seenPin[a.Pin] = true
 	}
 	return nil, nil, nil
 }
@@ -260,6 +288,30 @@ func (b *firmataBoard) SetPowerMode(_ context.Context, _ pb.PowerMode, _ *time.D
 
 func (b *firmataBoard) StreamTicks(_ context.Context, _ []board.DigitalInterrupt, _ chan board.Tick, _ map[string]any) error {
 	return errUnimplemented
+}
+
+// parseAnalogPin accepts "A0".."A15" or a raw digital pin number "0".."127".
+// The unknown side of the pair is returned as the sentinel -1; resolveAnalogPin
+// (called in NewBoard against the analog-mapping response) fills it in:
+//
+//	"A3"  -> (digitalPin: -1, analogChannel: 3)
+//	"14"  -> (digitalPin: 14, analogChannel: -1)
+func parseAnalogPin(s string) (digitalPin int, analogChannel int, err error) {
+	if s == "" {
+		return -1, -1, fmt.Errorf("analog pin name is empty")
+	}
+	if s[0] == 'A' || s[0] == 'a' {
+		n, err := strconv.Atoi(s[1:])
+		if err != nil || n < 0 || n > 15 {
+			return -1, -1, fmt.Errorf("invalid analog pin %q (want \"A0\".. \"A15\")", s)
+		}
+		return -1, n, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 || n > 127 {
+		return -1, -1, fmt.Errorf("invalid analog pin %q (want \"A0\".. \"A15\" or 0..127)", s)
+	}
+	return n, -1, nil
 }
 
 // Compile-time assertions that our types satisfy the full board interfaces.
