@@ -358,6 +358,11 @@ func (b *firmataBoard) pinSupports(pin int, mode firmata.PinMode) bool {
 	return ok
 }
 
+// resolveAnalogPin is implemented in Task 13.
+func resolveAnalogPin(digitalPin, analogChannel int, _ firmata.AnalogMappingResponse) (int, int, error) {
+	return digitalPin, analogChannel, fmt.Errorf("resolveAnalogPin: not implemented")
+}
+
 // Compile-time assertions that our types satisfy the full board interfaces.
 // If RDK adds new methods, the build will fail here pointing to the missing one.
 var (

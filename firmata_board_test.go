@@ -319,6 +319,86 @@ func TestConfig_Validate_Analogs(t *testing.T) {
 	})
 }
 
+// unoCaps returns a CapabilityResponse shaped like an Arduino Uno running
+// StandardFirmataPlus: 14 digital pins (0..13), of which 3, 5, 6, 9, 10, 11
+// support PWM, plus 6 analog pins (14..19) that support analog input. Pin 1
+// (RX) and pin 0 (TX) are also INPUT/OUTPUT-capable but kept simple here.
+func unoCaps() firmata.CapabilityResponse {
+	pins := make([]firmata.PinCapabilities, 20)
+	pwm := map[int]bool{3: true, 5: true, 6: true, 9: true, 10: true, 11: true}
+	for i := 0; i < 14; i++ {
+		caps := firmata.PinCapabilities{
+			firmata.PinModeInput:       1,
+			firmata.PinModeOutput:      1,
+			firmata.PinModeInputPullup: 1,
+		}
+		if pwm[i] {
+			caps[firmata.PinModePWM] = 8
+		}
+		pins[i] = caps
+	}
+	for i := 14; i < 20; i++ {
+		pins[i] = firmata.PinCapabilities{
+			firmata.PinModeInput:       1,
+			firmata.PinModeOutput:      1,
+			firmata.PinModeInputPullup: 1,
+			firmata.PinModeAnalog:      10,
+		}
+	}
+	return firmata.CapabilityResponse{Pins: pins}
+}
+
+// unoAnalogMap returns the analog mapping table for an Uno: digital pins
+// 0..13 are not analog (0x7F); pins 14..19 map to channels 0..5.
+func unoAnalogMap() firmata.AnalogMappingResponse {
+	channels := make([]uint8, 20)
+	for i := 0; i < 14; i++ {
+		channels[i] = 0x7F
+	}
+	for i := 14; i < 20; i++ {
+		channels[i] = uint8(i - 14)
+	}
+	return firmata.AnalogMappingResponse{ChannelByPin: channels}
+}
+
+// newTestBoardWithCaps builds a testBoard with the supplied capability +
+// analog-mapping data already injected.
+//
+// IMPORTANT: until Task 13 lands a real resolveAnalogPin, callers MUST pass
+// an empty (or nil) analogs slice. The Task-12 stub of resolveAnalogPin
+// always errors, and the helper t.Fatalfs on that error. No test in Task 12
+// references this helper with non-empty analogs; tests that need declared
+// analogs are introduced in Task 13.
+func newTestBoardWithCaps(
+	t *testing.T,
+	caps firmata.CapabilityResponse,
+	amap firmata.AnalogMappingResponse,
+	analogs []board.AnalogReaderConfig,
+) *testBoard {
+	t.Helper()
+	tb := newTestBoard(t)
+	tb.b.capabilities = caps
+	tb.b.analogMap = amap
+	for _, a := range analogs {
+		dpin, ch, err := parseAnalogPin(a.Pin)
+		if err != nil {
+			t.Fatalf("parseAnalogPin(%q): %v", a.Pin, err)
+		}
+		dpin, ch, err = resolveAnalogPin(dpin, ch, amap)
+		if err != nil {
+			t.Fatalf("resolveAnalogPin(%q): %v", a.Pin, err)
+		}
+		tb.b.analogs[a.Name] = &firmataAnalog{
+			board:      tb.b,
+			name:       a.Name,
+			digitalPin: dpin,
+			channel:    uint8(ch),
+		}
+		tb.b.ownedPins[dpin] = a.Name
+	}
+	return tb
+}
+
 func TestSet_AfterStreamClose_ReturnsError(t *testing.T) {
 	tb := newTestBoard(t)
 	defer tb.cleanup()
