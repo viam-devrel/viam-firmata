@@ -240,6 +240,35 @@ func TestEncodeAnalogMappingQuery(t *testing.T) {
 	}
 }
 
+func TestDecode_AnalogMessage(t *testing.T) {
+	// ANALOG_MESSAGE channel 0, value 512: 0xE0 0x00 0x04
+	r := bufio.NewReader(bytes.NewReader([]byte{0xE0, 0x00, 0x04}))
+	msg, err := decode(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	a, ok := msg.(AnalogMessage)
+	if !ok {
+		t.Fatalf("wanted AnalogMessage, got %T", msg)
+	}
+	if a.Channel != 0 || a.Value != 512 {
+		t.Errorf("got channel=%d value=%d, want channel=0 value=512", a.Channel, a.Value)
+	}
+}
+
+func TestDecode_AnalogMessage_HighChannel(t *testing.T) {
+	// ANALOG_MESSAGE channel 7, value 1023: 0xE7 0x7F 0x07
+	r := bufio.NewReader(bytes.NewReader([]byte{0xE7, 0x7F, 0x07}))
+	msg, err := decode(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	a := msg.(AnalogMessage)
+	if a.Channel != 7 || a.Value != 1023 {
+		t.Errorf("got channel=%d value=%d, want channel=7 value=1023", a.Channel, a.Value)
+	}
+}
+
 func TestNewMessageTypes_ZeroValues(t *testing.T) {
 	var am AnalogMessage
 	if am.Channel != 0 || am.Value != 0 {

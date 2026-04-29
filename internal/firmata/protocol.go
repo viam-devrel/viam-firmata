@@ -217,6 +217,20 @@ func decode(r *bufio.Reader) (Message, error) {
 		mask := (lsb & 0x7F) | ((msb & 0x01) << 7)
 		return DigitalPortMessage{Port: cmd & 0x0F, Mask: mask}, nil
 
+	case cmd&0xF0 == cmdAnalogMessage:
+		lsb, err := r.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read analog lsb: %w", err)
+		}
+		msb, err := r.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read analog msb: %w", err)
+		}
+		return AnalogMessage{
+			Channel: cmd & 0x0F,
+			Value:   uint16(lsb&0x7F) | (uint16(msb&0x7F) << 7),
+		}, nil
+
 	case cmd == cmdStartSysex:
 		// Consume until END_SYSEX. First byte after 0xF0 is the sysex command id.
 		payload, err := readUntilEndSysex(r)
