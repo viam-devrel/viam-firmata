@@ -175,6 +175,25 @@ func (c *Client) DigitalWrite(pin int, high bool) error {
 	return err
 }
 
+// EnableAnalogReporting enables or disables auto-reporting for an analog
+// channel. The argument is an analog channel index (0..15), parallel to
+// EnableDigitalReporting which takes a port index.
+func (c *Client) EnableAnalogReporting(channel int, enable bool) error {
+	if channel < 0 || channel > 15 {
+		return fmt.Errorf("analog channel %d out of range", channel)
+	}
+	return c.writeFrame(encodeReportAnalog(uint8(channel), enable))
+}
+
+// SetSamplingInterval sets the firmware-side sample interval (in ms) for
+// all enabled analog reports. Must be in 1..16383.
+func (c *Client) SetSamplingInterval(intervalMs int) error {
+	if intervalMs < 1 || intervalMs > 16383 {
+		return fmt.Errorf("sampling interval %dms out of range (1..16383)", intervalMs)
+	}
+	return c.writeFrame(encodeSamplingInterval(uint16(intervalMs)))
+}
+
 // AnalogWrite writes an analog value (e.g. PWM duty 0..255 or DAC value).
 // Pins 0..15 use ANALOG_MESSAGE (0xE0|channel, 3 bytes); pins 16..127 use
 // EXTENDED_ANALOG sysex (6 bytes). The pin number passed here is the

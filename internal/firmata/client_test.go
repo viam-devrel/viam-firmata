@@ -330,6 +330,56 @@ func TestAnalogWrite_OutOfRange(t *testing.T) {
 	}
 }
 
+func TestEnableAnalogReportingWritesBytes(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	go func() { _ = c.EnableAnalogReporting(0, true) }()
+	got := readN(t, pp.board, 2)
+	want := []byte{0xC0, 0x01}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+}
+
+func TestEnableAnalogReporting_OutOfRange(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+	if err := c.EnableAnalogReporting(-1, true); err == nil {
+		t.Errorf("EnableAnalogReporting(-1): want error")
+	}
+	if err := c.EnableAnalogReporting(16, true); err == nil {
+		t.Errorf("EnableAnalogReporting(16): want error")
+	}
+}
+
+func TestSetSamplingIntervalWritesBytes(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	go func() { _ = c.SetSamplingInterval(100) }()
+	got := readN(t, pp.board, 5)
+	want := []byte{0xF0, 0x7A, 0x64, 0x00, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+}
+
+func TestSetSamplingInterval_OutOfRange(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+	if err := c.SetSamplingInterval(0); err == nil {
+		t.Errorf("SetSamplingInterval(0): want error")
+	}
+	if err := c.SetSamplingInterval(16384); err == nil {
+		t.Errorf("SetSamplingInterval(16384): want error")
+	}
+}
+
 type rwAdapter struct {
 	r io.ReadCloser
 	w io.WriteCloser
