@@ -292,6 +292,44 @@ func TestReadAnalog_BeforeAndAfterDispatch(t *testing.T) {
 	}
 }
 
+func TestAnalogWrite_LowChannel_EmitsAnalogMessage(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	go func() { _ = c.AnalogWrite(6, 200) }()
+	got := readN(t, pp.board, 3)
+	want := []byte{0xE6, 0x48, 0x01}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+}
+
+func TestAnalogWrite_HighPin_EmitsExtendedAnalog(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+
+	go func() { _ = c.AnalogWrite(20, 200) }()
+	got := readN(t, pp.board, 6)
+	want := []byte{0xF0, 0x6F, 20, 0x48, 0x01, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+}
+
+func TestAnalogWrite_OutOfRange(t *testing.T) {
+	pp := newPipePair()
+	c := New(pp.host)
+	defer c.Close()
+	if err := c.AnalogWrite(-1, 0); err == nil {
+		t.Errorf("AnalogWrite(-1): want error, got nil")
+	}
+	if err := c.AnalogWrite(128, 0); err == nil {
+		t.Errorf("AnalogWrite(128): want error, got nil")
+	}
+}
+
 type rwAdapter struct {
 	r io.ReadCloser
 	w io.WriteCloser

@@ -175,6 +175,21 @@ func (c *Client) DigitalWrite(pin int, high bool) error {
 	return err
 }
 
+// AnalogWrite writes an analog value (e.g. PWM duty 0..255 or DAC value).
+// Pins 0..15 use ANALOG_MESSAGE (0xE0|channel, 3 bytes); pins 16..127 use
+// EXTENDED_ANALOG sysex (6 bytes). The pin number passed here is the
+// digital-pin index — for ANALOG_MESSAGE it doubles as the channel because
+// firmware accepts the pin number in the low nibble of the command byte.
+func (c *Client) AnalogWrite(pin int, value uint16) error {
+	if pin < 0 || pin > 127 {
+		return fmt.Errorf("pin %d out of range", pin)
+	}
+	if pin <= 15 {
+		return c.writeFrame(encodeAnalogWrite(uint8(pin), value))
+	}
+	return c.writeFrame(encodeExtendedAnalog(uint8(pin), value))
+}
+
 // ReadDigital returns the cached input level of a digital pin.
 // Returns false if the pin is out of range [0, 127] or if no DIGITAL_MESSAGE
 // has yet been received for the pin's port (i.e. reporting was never enabled
