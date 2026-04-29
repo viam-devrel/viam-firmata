@@ -16,18 +16,18 @@ type PinChange struct {
 }
 
 type Client struct {
-	rw         io.ReadWriteCloser
-	br         *bufio.Reader
+	rw          io.ReadWriteCloser
+	br          *bufio.Reader
 	portState   [16]uint8  // last-known input mask per port
 	outState    [16]uint8  // last-written output mask per port
 	analogState [16]uint16 // last-known value per analog channel
-	events     chan PinChange
-	version    chan VersionMessage
-	readErr    atomic.Pointer[error]
-	readerDone chan struct{}
-	writeMu    sync.Mutex
-	stateMu    sync.RWMutex // guards portState for external readers
-	closed     atomic.Bool
+	events      chan PinChange
+	version     chan VersionMessage
+	readErr     atomic.Pointer[error]
+	readerDone  chan struct{}
+	writeMu     sync.Mutex
+	stateMu     sync.RWMutex // guards portState for external readers
+	closed      atomic.Bool
 }
 
 func New(rw io.ReadWriteCloser) *Client {
