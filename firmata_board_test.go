@@ -380,13 +380,10 @@ func unoAnalogMap() firmata.AnalogMappingResponse {
 }
 
 // newTestBoardWithCaps builds a testBoard with the supplied capability +
-// analog-mapping data already injected.
-//
-// IMPORTANT: until Task 13 lands a real resolveAnalogPin, callers MUST pass
-// an empty (or nil) analogs slice. The Task-12 stub of resolveAnalogPin
-// always errors, and the helper t.Fatalfs on that error. No test in Task 12
-// references this helper with non-empty analogs; tests that need declared
-// analogs are introduced in Task 13.
+// analog-mapping data already injected, then registers each declared analog
+// against that mapping. It bypasses the Handshake / capability-query flow
+// the production NewBoard runs — call newConstructorTestBoard for tests
+// that need the full constructor path.
 func newTestBoardWithCaps(
 	t *testing.T,
 	caps firmata.CapabilityResponse,
@@ -548,6 +545,9 @@ func TestGPIOPin_Get_RejectedWhenOwnedByAnalog(t *testing.T) {
 	pin, _ := tb.b.GPIOPinByName("14")
 	if _, err := pin.Get(context.Background(), nil); err == nil {
 		t.Fatal("Get on owned pin: want error, got nil")
+	}
+	if got := tb.sentBuf.Len(); got != 0 {
+		t.Errorf("Get on owned pin emitted %d bytes; want zero-IO refusal", got)
 	}
 }
 
