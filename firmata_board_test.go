@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -104,6 +106,28 @@ type rwFake struct {
 func (f *rwFake) Read(p []byte) (int, error)  { return f.r.Read(p) }
 func (f *rwFake) Write(p []byte) (int, error) { return f.w.Write(p) }
 func (f *rwFake) Close() error                { return nil }
+
+// syncBuf is a mutex-protected bytes.Buffer for use in tests where multiple
+// goroutines may write concurrently (e.g. the fire-and-forget write goroutines
+// inside QueryCapabilities / QueryAnalogMapping).
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuf) Bytes() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := make([]byte, s.buf.Len())
+	copy(b, s.buf.Bytes())
+	return b
+}
 
 func TestGPIOPin_Set_EmitsPinModeOnceThenDigitalWrites(t *testing.T) {
 	tb := newTestBoard(t)
@@ -662,5 +686,154 @@ func TestSet_AfterStreamClose_ReturnsError(t *testing.T) {
 	}
 	if lastErr == nil {
 		t.Fatalf("expected an error after stream close, got nil")
+	}
+}
+
+// newConstructorTestBoard builds a *firmataBoard via the same code path
+// production NewBoard uses for post-handshake setup (initializeAnalogs),
+// without going through serial.Open / DTR. The fake firmware writes a
+// canonical handshake + capability + analog-mapping reply.
+//
+// Returns the board, the arduino-side writer (for further frame injection),
+// and a syncBuf capturing every byte the board has written. syncBuf is used
+// because QueryCapabilities/QueryAnalogMapping fire write goroutines that race
+// against the test goroutine reading sentBuf.
+func newConstructorTestBoard(
+	t *testing.T,
+	cfg *Config,
+	caps firmata.CapabilityResponse,
+	amap firmata.AnalogMappingResponse,
+) (*firmataBoard, io.WriteCloser, *syncBuf) {
+	t.Helper()
+
+	arduinoR, arduinoW := io.Pipe()
+	sentBuf := &syncBuf{}
+	rw := &rwFake{r: arduinoR, w: sentBuf}
+	c := firmata.New(rw)
+
+	go func() {
+		_, _ = arduinoW.Write([]byte{0xF9, 0x02, 0x05}) // REPORT_VERSION 2.5
+		_, _ = arduinoW.Write(encodeCapabilityResponseForTest(caps))
+		_, _ = arduinoW.Write(encodeAnalogMappingResponseForTest(amap))
+	}()
+
+	hsCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := c.Handshake(hsCtx); err != nil {
+		t.Fatalf("Handshake: %v", err)
+	}
+
+	name := board.Named("test")
+	b := newBoardFromClient(name, c, rw, logging.NewTestLogger(t))
+	if err := b.initializeAnalogs(hsCtx, cfg, logging.NewTestLogger(t)); err != nil {
+		t.Fatalf("initializeAnalogs: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = arduinoW.Close()
+		_ = b.Close(context.Background())
+	})
+
+	return b, arduinoW, sentBuf
+}
+
+// encodeCapabilityResponseForTest re-serializes a CapabilityResponse to its
+// Firmata wire form. Used only by tests to feed a fake firmware reply.
+func encodeCapabilityResponseForTest(cr firmata.CapabilityResponse) []byte {
+	out := []byte{0xF0, 0x6C}
+	for _, p := range cr.Pins {
+		modes := make([]firmata.PinMode, 0, len(p))
+		for m := range p {
+			modes = append(modes, m)
+		}
+		sort.Slice(modes, func(i, j int) bool { return modes[i] < modes[j] })
+		for _, m := range modes {
+			out = append(out, uint8(m), p[m])
+		}
+		out = append(out, 0x7F)
+	}
+	out = append(out, 0xF7)
+	return out
+}
+
+func encodeAnalogMappingResponseForTest(am firmata.AnalogMappingResponse) []byte {
+	out := []byte{0xF0, 0x6A}
+	out = append(out, am.ChannelByPin...)
+	out = append(out, 0xF7)
+	return out
+}
+
+func encodeSamplingIntervalForTest(ms uint16) []byte {
+	return []byte{0xF0, 0x7A, uint8(ms & 0x7F), uint8((ms >> 7) & 0x7F), 0xF7}
+}
+
+func TestConstructor_EmitsSamplingIntervalWhenConfigured(t *testing.T) {
+	cfg := &Config{
+		SerialPath:         "/dev/null", // unused (we bypass serial.Open)
+		SamplingIntervalMs: 50,
+	}
+	_, _, sentBuf := newConstructorTestBoard(t, cfg, unoCaps(), unoAnalogMap())
+
+	want := encodeSamplingIntervalForTest(50)
+	if !bytes.Contains(sentBuf.Bytes(), want) {
+		t.Errorf("expected SAMPLING_INTERVAL frame % X in % X", want, sentBuf.Bytes())
+	}
+}
+
+func TestConstructor_BuildsAnalogReaders(t *testing.T) {
+	cfg := &Config{
+		SerialPath: "/dev/null",
+		Analogs:    []board.AnalogReaderConfig{{Name: "x", Pin: "A0"}},
+	}
+	b, _, _ := newConstructorTestBoard(t, cfg, unoCaps(), unoAnalogMap())
+
+	a, err := b.AnalogByName("x")
+	if err != nil {
+		t.Fatalf("AnalogByName: %v", err)
+	}
+	if a == nil {
+		t.Fatal("AnalogByName returned nil analog")
+	}
+}
+
+// TestInitializeAnalogs_RejectsNonAnalogPin asserts the seam itself
+// surfaces a structured error when a declared analog targets a pin without
+// analog capability — exercising the same code path NewBoard uses.
+func TestInitializeAnalogs_RejectsNonAnalogPin(t *testing.T) {
+	caps := firmata.CapabilityResponse{Pins: make([]firmata.PinCapabilities, 4)}
+	caps.Pins[2] = firmata.PinCapabilities{firmata.PinModeOutput: 1}
+	amap := firmata.AnalogMappingResponse{ChannelByPin: []uint8{0x7F, 0x7F, 0x7F, 0x7F}}
+
+	arduinoR, arduinoW := io.Pipe()
+	sentBuf := &syncBuf{}
+	rw := &rwFake{r: arduinoR, w: sentBuf}
+	c := firmata.New(rw)
+
+	go func() {
+		_, _ = arduinoW.Write([]byte{0xF9, 0x02, 0x05})
+		_, _ = arduinoW.Write(encodeCapabilityResponseForTest(caps))
+		_, _ = arduinoW.Write(encodeAnalogMappingResponseForTest(amap))
+	}()
+
+	hsCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := c.Handshake(hsCtx); err != nil {
+		t.Fatalf("Handshake: %v", err)
+	}
+
+	b := newBoardFromClient(board.Named("rej"), c, rw, logging.NewTestLogger(t))
+	// Close arduinoW before b.Close so the readLoop sees EOF and exits cleanly.
+	t.Cleanup(func() {
+		_ = arduinoW.Close()
+		_ = b.Close(context.Background())
+	})
+
+	cfg := &Config{
+		SerialPath: "/dev/null",
+		Analogs:    []board.AnalogReaderConfig{{Name: "bad", Pin: "2"}},
+	}
+	err := b.initializeAnalogs(hsCtx, cfg, logging.NewTestLogger(t))
+	if err == nil {
+		t.Fatal("expected error rejecting non-analog pin, got nil")
 	}
 }

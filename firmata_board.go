@@ -303,8 +303,8 @@ func NewBoard(ctx context.Context, _ resource.Dependencies, conf resource.Config
 	c := firmata.New(sp)
 
 	hsCtx, cancel := context.WithTimeout(ctx, hsTimeout)
+	defer cancel()
 	major, minor, err := c.Handshake(hsCtx)
-	cancel()
 	if err != nil {
 		_ = c.Close()
 		_ = sp.Close()
@@ -312,7 +312,12 @@ func NewBoard(ctx context.Context, _ resource.Dependencies, conf resource.Config
 	}
 	logger.Infof("firmata board: connected to %s — firmware v%d.%d", cfg.SerialPath, major, minor)
 
-	return newBoardFromClient(conf.ResourceName(), c, sp, logger), nil
+	b := newBoardFromClient(conf.ResourceName(), c, sp, logger)
+	if err := b.initializeAnalogs(hsCtx, cfg, logger); err != nil {
+		_ = b.Close(ctx)
+		return nil, fmt.Errorf("init on %s: %w", cfg.SerialPath, err)
+	}
+	return b, nil
 }
 
 // --- Board-level methods outside the v1 digital-GPIO scope ---
@@ -403,6 +408,58 @@ func (a *firmataAnalog) Read(_ context.Context, _ map[string]any) (board.AnalogV
 
 func (a *firmataAnalog) Write(_ context.Context, _ int, _ map[string]any) error {
 	return errUnimplemented
+}
+
+// initializeAnalogs runs the post-handshake board setup: capability query,
+// analog-mapping query, optional SAMPLING_INTERVAL emit, and then builds
+// the analogs / ownedPins maps from cfg.Analogs.
+//
+// On any error the board is left in a partially-initialized state — caller
+// is responsible for calling Close(). This is the single source of truth
+// for the analog initialization sequence: NewBoard and the test harness
+// both call it so a single edit point gates both production and tests.
+func (b *firmataBoard) initializeAnalogs(ctx context.Context, cfg *Config, logger logging.Logger) error {
+	caps, err := b.client.QueryCapabilities(ctx)
+	if err != nil {
+		return fmt.Errorf("capability query: %w", err)
+	}
+	amap, err := b.client.QueryAnalogMapping(ctx)
+	if err != nil {
+		return fmt.Errorf("analog mapping query: %w", err)
+	}
+
+	if cfg.SamplingIntervalMs > 0 {
+		if err := b.client.SetSamplingInterval(cfg.SamplingIntervalMs); err != nil {
+			return fmt.Errorf("set sampling interval: %w", err)
+		}
+	}
+
+	b.capabilities = caps
+	b.analogMap = amap
+
+	for _, ac := range cfg.Analogs {
+		dpin, ch, err := parseAnalogPin(ac.Pin)
+		if err != nil {
+			return fmt.Errorf("analog %q: %w", ac.Name, err)
+		}
+		dpin, ch, err = resolveAnalogPin(dpin, ch, amap)
+		if err != nil {
+			return fmt.Errorf("analog %q: %w", ac.Name, err)
+		}
+		if !b.pinSupports(dpin, firmata.PinModeAnalog) {
+			return fmt.Errorf("analog %q: pin %d does not support analog mode", ac.Name, dpin)
+		}
+		if ac.SamplesPerSecond != 0 {
+			logger.Warnf("firmata board: analog %q samples_per_sec=%d ignored — Firmata only supports a global sampling_interval_ms",
+				ac.Name, ac.SamplesPerSecond)
+		}
+		b.analogs[ac.Name] = &firmataAnalog{
+			board: b, name: ac.Name, digitalPin: dpin, channel: uint8(ch),
+		}
+		b.ownedPins[dpin] = ac.Name
+	}
+
+	return nil
 }
 
 // pinSupports reports whether the firmware advertises the given mode for
