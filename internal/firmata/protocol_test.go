@@ -157,3 +157,25 @@ func TestDecode_SysexOverflowErrors(t *testing.T) {
 		t.Fatal("expected error for unbounded sysex, got nil")
 	}
 }
+
+func TestNewMessageTypes_ZeroValues(t *testing.T) {
+	var am AnalogMessage
+	if am.Channel != 0 || am.Value != 0 {
+		t.Errorf("AnalogMessage zero value: %+v", am)
+	}
+
+	var cr CapabilityResponse
+	if cr.Pins != nil {
+		t.Errorf("CapabilityResponse.Pins zero value: %v", cr.Pins)
+	}
+
+	var ar AnalogMappingResponse
+	if ar.ChannelByPin != nil {
+		t.Errorf("AnalogMappingResponse.ChannelByPin zero value: %v", ar.ChannelByPin)
+	}
+
+	// Ensure they all satisfy the Message interface (compile-time check via assertion).
+	var _ Message = AnalogMessage{}
+	var _ Message = CapabilityResponse{}
+	var _ Message = AnalogMappingResponse{}
+}

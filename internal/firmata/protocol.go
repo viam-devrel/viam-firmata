@@ -20,6 +20,16 @@ const (
 	cmdReportVersion  uint8 = 0xF9
 )
 
+// Sysex sub-command bytes. See https://github.com/firmata/protocol/blob/master/protocol.md
+const (
+	sysexAnalogMappingQuery    uint8 = 0x69
+	sysexAnalogMappingResponse uint8 = 0x6A
+	sysexCapabilityQuery       uint8 = 0x6B
+	sysexCapabilityResponse    uint8 = 0x6C
+	sysexExtendedAnalog        uint8 = 0x6F
+	sysexSamplingInterval      uint8 = 0x7A
+)
+
 // PinMode values per the Firmata spec.
 type PinMode uint8
 
@@ -71,6 +81,38 @@ type DigitalPortMessage struct {
 }
 
 func (DigitalPortMessage) isMessage() {}
+
+// AnalogMessage carries one ADC sample for a single analog channel.
+// Value is 14-bit on the wire (firmware splits into two 7-bit bytes); real
+// AVR boards send 10-bit samples (0..1023).
+type AnalogMessage struct {
+	Channel uint8
+	Value   uint16
+}
+
+func (AnalogMessage) isMessage() {}
+
+// PinCapabilities maps each supported PinMode to its resolution in bits.
+// A pin reports zero or more (mode, resolution) pairs in a CAPABILITY_RESPONSE.
+type PinCapabilities map[PinMode]uint8
+
+// CapabilityResponse is the decoded payload of a CAPABILITY_RESPONSE sysex.
+// Pins is indexed by digital pin number; entries for pins absent from the
+// firmware response are nil.
+type CapabilityResponse struct {
+	Pins []PinCapabilities
+}
+
+func (CapabilityResponse) isMessage() {}
+
+// AnalogMappingResponse is the decoded payload of an ANALOG_MAPPING_RESPONSE
+// sysex. ChannelByPin[digitalPin] = analog channel, or 127 (0x7F) if the pin
+// is not analog-capable.
+type AnalogMappingResponse struct {
+	ChannelByPin []uint8
+}
+
+func (AnalogMappingResponse) isMessage() {}
 
 // UnknownMessage is returned for any command we don't explicitly handle,
 // including sysex. Callers can ignore it.
