@@ -399,6 +399,111 @@ func newTestBoardWithCaps(
 	return tb
 }
 
+func TestResolveAnalogPin(t *testing.T) {
+	amap := unoAnalogMap()
+
+	t.Run("A0 maps to digital pin 14", func(t *testing.T) {
+		dpin, ch, err := resolveAnalogPin(-1, 0, amap)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if dpin != 14 || ch != 0 {
+			t.Errorf("got (%d, %d), want (14, 0)", dpin, ch)
+		}
+	})
+
+	t.Run("digital 14 maps to channel 0", func(t *testing.T) {
+		dpin, ch, err := resolveAnalogPin(14, -1, amap)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if dpin != 14 || ch != 0 {
+			t.Errorf("got (%d, %d), want (14, 0)", dpin, ch)
+		}
+	})
+
+	t.Run("non-analog digital pin fails", func(t *testing.T) {
+		if _, _, err := resolveAnalogPin(13, -1, amap); err == nil {
+			t.Errorf("expected error for non-analog pin")
+		}
+	})
+
+	t.Run("unknown channel fails", func(t *testing.T) {
+		if _, _, err := resolveAnalogPin(-1, 9, amap); err == nil {
+			t.Errorf("expected error for unmapped channel")
+		}
+	})
+}
+
+func TestAnalogRead_FirstCallEmitsModeAndReporting(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(),
+		[]board.AnalogReaderConfig{{Name: "x", Pin: "A0"}})
+	defer tb.cleanup()
+
+	a, err := tb.b.AnalogByName("x")
+	if err != nil {
+		t.Fatalf("AnalogByName: %v", err)
+	}
+
+	val, err := a.Read(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if val.Value != 0 || val.Min != 0 || val.Max != 1023 {
+		t.Errorf("first Read = %+v, want value=0 min=0 max=1023", val)
+	}
+
+	want := []byte{
+		0xF4, 14, 0x02, // SET_PIN_MODE(14, ANALOG)
+		0xC0, 0x01, // REPORT_ANALOG(0, on)
+	}
+	if got := tb.sentBuf.Bytes(); !bytes.Equal(got, want) {
+		t.Fatalf("wire bytes:\n got = % X\nwant = % X", got, want)
+	}
+
+	// Inject ANALOG_MESSAGE channel 0, value 512.
+	if _, err := tb.arduinoW.Write([]byte{0xE0, 0x00, 0x04}); err != nil {
+		t.Fatalf("inject frame: %v", err)
+	}
+
+	// Poll for cached value.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		v, _ := a.Read(context.Background(), nil)
+		if v.Value == 512 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	val, _ = a.Read(context.Background(), nil)
+	if val.Value != 512 {
+		t.Fatalf("Read after frame = %d, want 512", val.Value)
+	}
+
+	// A second Read after enableOnce must not re-emit SET_PIN_MODE/REPORT_ANALOG.
+	if got := tb.sentBuf.Len(); got != len(want) {
+		t.Errorf("extra bytes after subsequent Read: got %d, want %d", got, len(want))
+	}
+}
+
+func TestAnalogRead_UnknownName(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(), nil)
+	defer tb.cleanup()
+	if _, err := tb.b.AnalogByName("nope"); err == nil {
+		t.Errorf("AnalogByName(nope): want error")
+	}
+}
+
+func TestAnalogWrite_OnAnalogReaderReturnsUnimplemented(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(),
+		[]board.AnalogReaderConfig{{Name: "x", Pin: "A0"}})
+	defer tb.cleanup()
+	a, _ := tb.b.AnalogByName("x")
+	if err := a.Write(context.Background(), 100, nil); !errors.Is(err, errUnimplemented) {
+		t.Errorf("Write: want errUnimplemented, got %v", err)
+	}
+}
+
 func TestSet_AfterStreamClose_ReturnsError(t *testing.T) {
 	tb := newTestBoard(t)
 	defer tb.cleanup()

@@ -292,8 +292,12 @@ func NewBoard(ctx context.Context, _ resource.Dependencies, conf resource.Config
 
 // --- Board-level methods outside the v1 digital-GPIO scope ---
 
-func (b *firmataBoard) AnalogByName(string) (board.Analog, error) {
-	return nil, errUnimplemented
+func (b *firmataBoard) AnalogByName(name string) (board.Analog, error) {
+	a, ok := b.analogs[name]
+	if !ok {
+		return nil, fmt.Errorf("firmata board: no analog named %q", name)
+	}
+	return a, nil
 }
 
 func (b *firmataBoard) DigitalInterruptByName(string) (board.DigitalInterrupt, error) {
@@ -344,6 +348,38 @@ type firmataAnalog struct {
 	enableErr  atomic.Pointer[error]
 }
 
+func (a *firmataAnalog) Read(_ context.Context, _ map[string]any) (board.AnalogValue, error) {
+	a.enableOnce.Do(func() {
+		if err := a.board.client.SetPinMode(a.digitalPin, firmata.PinModeAnalog); err != nil {
+			a.enableErr.Store(&err)
+			return
+		}
+		if err := a.board.client.EnableAnalogReporting(int(a.channel), true); err != nil {
+			a.enableErr.Store(&err)
+			return
+		}
+		a.board.mu.Lock()
+		a.board.pinModes[a.digitalPin] = firmata.PinModeAnalog
+		a.board.mu.Unlock()
+	})
+	// enableErr is set once inside enableOnce.Do and never cleared, so
+	// subsequent Reads return the same cached error rather than retrying
+	// mid-traffic.
+	if errp := a.enableErr.Load(); errp != nil {
+		return board.AnalogValue{}, *errp
+	}
+	return board.AnalogValue{
+		Value:    int(a.board.client.ReadAnalog(int(a.channel))),
+		Min:      0,
+		Max:      1023,
+		StepSize: 5.0 / 1024,
+	}, nil
+}
+
+func (a *firmataAnalog) Write(_ context.Context, _ int, _ map[string]any) error {
+	return errUnimplemented
+}
+
 // pinSupports reports whether the firmware advertises the given mode for
 // the pin. Returns false if the pin is out of the capability map or the
 // capability table is empty (e.g. before handshake-time discovery has
@@ -358,9 +394,33 @@ func (b *firmataBoard) pinSupports(pin int, mode firmata.PinMode) bool {
 	return ok
 }
 
-// resolveAnalogPin is implemented in Task 13.
-func resolveAnalogPin(digitalPin, analogChannel int, _ firmata.AnalogMappingResponse) (int, int, error) {
-	return digitalPin, analogChannel, fmt.Errorf("resolveAnalogPin: not implemented")
+// resolveAnalogPin fills in whichever side of the (digitalPin, analogChannel)
+// pair was left as the -1 sentinel by parseAnalogPin, using the analog mapping
+// reported by the firmware. Returns an error if the pin/channel doesn't appear
+// in the mapping.
+func resolveAnalogPin(digitalPin, analogChannel int, amap firmata.AnalogMappingResponse) (int, int, error) {
+	switch {
+	case digitalPin >= 0 && analogChannel == -1:
+		// Digital -> channel.
+		if digitalPin >= len(amap.ChannelByPin) {
+			return 0, 0, fmt.Errorf("pin %d out of range of analog mapping (len=%d)", digitalPin, len(amap.ChannelByPin))
+		}
+		ch := amap.ChannelByPin[digitalPin]
+		if ch == 0x7F {
+			return 0, 0, fmt.Errorf("pin %d is not analog-capable", digitalPin)
+		}
+		return digitalPin, int(ch), nil
+	case digitalPin == -1 && analogChannel >= 0:
+		// Channel -> digital pin: linear scan, mappings are short.
+		for i, ch := range amap.ChannelByPin {
+			if int(ch) == analogChannel {
+				return i, analogChannel, nil
+			}
+		}
+		return 0, 0, fmt.Errorf("analog channel %d not advertised by firmware", analogChannel)
+	default:
+		return 0, 0, fmt.Errorf("resolveAnalogPin: invalid input (digitalPin=%d, channel=%d)", digitalPin, analogChannel)
+	}
 }
 
 // Compile-time assertions that our types satisfy the full board interfaces.
