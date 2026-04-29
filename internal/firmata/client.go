@@ -18,8 +18,9 @@ type PinChange struct {
 type Client struct {
 	rw         io.ReadWriteCloser
 	br         *bufio.Reader
-	portState  [16]uint8 // last-known input mask per port
-	outState   [16]uint8 // last-written output mask per port
+	portState   [16]uint8  // last-known input mask per port
+	outState    [16]uint8  // last-written output mask per port
+	analogState [16]uint16 // last-known value per analog channel
 	events     chan PinChange
 	version    chan VersionMessage
 	readErr    atomic.Pointer[error]
@@ -78,6 +79,8 @@ func (c *Client) readLoop() {
 			}
 		case DigitalPortMessage:
 			c.dispatchDigital(m)
+		case AnalogMessage:
+			c.dispatchAnalog(m)
 		case UnknownMessage:
 			// Ignore — sysex, analog reports we didn't subscribe to, etc.
 		}
@@ -185,4 +188,27 @@ func (c *Client) ReadDigital(pin int) bool {
 	c.stateMu.RLock()
 	defer c.stateMu.RUnlock()
 	return c.portState[port]&(1<<bit) != 0
+}
+
+// dispatchAnalog stores the latest analog reading for the channel under
+// stateMu so ReadAnalog can read concurrently with the reader goroutine.
+func (c *Client) dispatchAnalog(m AnalogMessage) {
+	if int(m.Channel) >= len(c.analogState) {
+		return
+	}
+	c.stateMu.Lock()
+	c.analogState[m.Channel] = m.Value
+	c.stateMu.Unlock()
+}
+
+// ReadAnalog returns the cached last value for the given analog channel.
+// Returns 0 if the channel is out of range [0, 15] or no ANALOG_MESSAGE has
+// arrived for that channel yet.
+func (c *Client) ReadAnalog(channel int) uint16 {
+	if channel < 0 || channel >= len(c.analogState) {
+		return 0
+	}
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return c.analogState[channel]
 }

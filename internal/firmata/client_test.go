@@ -251,6 +251,47 @@ func TestReadDigital_BeforeAndAfterDispatch(t *testing.T) {
 	}
 }
 
+func TestReadAnalog_BeforeAndAfterDispatch(t *testing.T) {
+	arduinoR, clientW := io.Pipe()
+	clientR, arduinoW := io.Pipe()
+	defer arduinoR.Close()
+	defer arduinoW.Close()
+
+	rw := &rwAdapter{r: clientR, w: clientW}
+	c := New(rw)
+	defer c.Close()
+
+	// Before any ANALOG_MESSAGE arrives, all channels read 0.
+	if v := c.ReadAnalog(0); v != 0 {
+		t.Fatalf("ReadAnalog(0) before any frame: got %d, want 0", v)
+	}
+
+	// Push ANALOG_MESSAGE for channel 0, value 512: 0xE0 0x00 0x04.
+	if _, err := arduinoW.Write([]byte{0xE0, 0x00, 0x04}); err != nil {
+		t.Fatalf("write frame: %v", err)
+	}
+
+	// Poll for the dispatch (no events channel for analog; rely on cached state).
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if c.ReadAnalog(0) == 512 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if v := c.ReadAnalog(0); v != 512 {
+		t.Fatalf("ReadAnalog(0) after dispatch: got %d, want 512", v)
+	}
+	if v := c.ReadAnalog(1); v != 0 {
+		t.Fatalf("ReadAnalog(1) unrelated: got %d, want 0", v)
+	}
+
+	// Out-of-range pins return 0.
+	if c.ReadAnalog(-1) != 0 || c.ReadAnalog(16) != 0 {
+		t.Fatalf("out-of-range channels should return 0")
+	}
+}
+
 type rwAdapter struct {
 	r io.ReadCloser
 	w io.WriteCloser
