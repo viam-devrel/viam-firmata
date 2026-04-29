@@ -191,6 +191,9 @@ func (p *firmataGPIOPin) ensureMode(mode firmata.PinMode) error {
 }
 
 func (p *firmataGPIOPin) Set(_ context.Context, high bool, _ map[string]any) error {
+	if owner, taken := p.board.ownedPins[p.pin]; taken {
+		return fmt.Errorf("firmata board: pin %d is owned by analog %q", p.pin, owner)
+	}
 	if err := p.ensureMode(firmata.PinModeOutput); err != nil {
 		return err
 	}
@@ -202,6 +205,9 @@ func (p *firmataGPIOPin) Set(_ context.Context, high bool, _ map[string]any) err
 // reader goroutine. No I/O happens on subsequent calls once the pin mode is
 // cached.
 func (p *firmataGPIOPin) Get(_ context.Context, _ map[string]any) (bool, error) {
+	if owner, taken := p.board.ownedPins[p.pin]; taken {
+		return false, fmt.Errorf("firmata board: pin %d is owned by analog %q", p.pin, owner)
+	}
 	if err := p.ensureMode(firmata.PinModeInputPullup); err != nil {
 		return false, err
 	}

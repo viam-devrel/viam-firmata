@@ -504,6 +504,46 @@ func TestAnalogWrite_OnAnalogReaderReturnsUnimplemented(t *testing.T) {
 	}
 }
 
+func TestGPIOPin_Set_RejectedWhenOwnedByAnalog(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(),
+		[]board.AnalogReaderConfig{{Name: "joy", Pin: "A0"}})
+	defer tb.cleanup()
+
+	pin, err := tb.b.GPIOPinByName("14") // A0 == digital 14
+	if err != nil {
+		t.Fatalf("GPIOPinByName: %v", err)
+	}
+	err = pin.Set(context.Background(), true, nil)
+	if err == nil {
+		t.Fatal("Set on owned pin: want error, got nil")
+	}
+	if got := tb.sentBuf.Len(); got != 0 {
+		t.Errorf("Set on owned pin emitted %d bytes; want zero-IO refusal", got)
+	}
+}
+
+func TestGPIOPin_Get_RejectedWhenOwnedByAnalog(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(),
+		[]board.AnalogReaderConfig{{Name: "joy", Pin: "A0"}})
+	defer tb.cleanup()
+
+	pin, _ := tb.b.GPIOPinByName("14")
+	if _, err := pin.Get(context.Background(), nil); err == nil {
+		t.Fatal("Get on owned pin: want error, got nil")
+	}
+}
+
+func TestGPIOPin_Set_UnaffectedWhenAnotherPinIsOwned(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(),
+		[]board.AnalogReaderConfig{{Name: "joy", Pin: "A0"}})
+	defer tb.cleanup()
+
+	pin, _ := tb.b.GPIOPinByName("13")
+	if err := pin.Set(context.Background(), true, nil); err != nil {
+		t.Fatalf("Set on unowned pin: %v", err)
+	}
+}
+
 func TestSet_AfterStreamClose_ReturnsError(t *testing.T) {
 	tb := newTestBoard(t)
 	defer tb.cleanup()
