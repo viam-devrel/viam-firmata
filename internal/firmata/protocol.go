@@ -232,12 +232,21 @@ func decode(r *bufio.Reader) (Message, error) {
 		}, nil
 
 	case cmd == cmdStartSysex:
-		// Consume until END_SYSEX. First byte after 0xF0 is the sysex command id.
 		payload, err := readUntilEndSysex(r)
 		if err != nil {
 			return nil, fmt.Errorf("read sysex: %w", err)
 		}
-		return UnknownMessage{Cmd: cmdStartSysex, Payload: payload}, nil
+		if len(payload) == 0 {
+			return UnknownMessage{Cmd: cmdStartSysex, Payload: payload}, nil
+		}
+		switch payload[0] {
+		case sysexCapabilityResponse:
+			return decodeCapabilityResponse(payload[1:]), nil
+		case sysexAnalogMappingResponse:
+			return decodeAnalogMappingResponse(payload[1:]), nil
+		default:
+			return UnknownMessage{Cmd: cmdStartSysex, Payload: payload}, nil
+		}
 
 	default:
 		// Any other command byte in the 0x80..0xEF range is a 3-byte message
@@ -280,4 +289,35 @@ func readUntilEndSysex(r *bufio.Reader) ([]byte, error) {
 		}
 		out = append(out, b)
 	}
+}
+
+// decodeCapabilityResponse parses a CAPABILITY_RESPONSE payload (already
+// stripped of leading 0x6C and trailing 0xF7). Each pin contributes zero or
+// more (mode, resolution) pairs followed by a 0x7F terminator.
+func decodeCapabilityResponse(p []byte) CapabilityResponse {
+	pins := []PinCapabilities{}
+	current := PinCapabilities{}
+	for i := 0; i < len(p); i++ {
+		if p[i] == 0x7F {
+			pins = append(pins, current)
+			current = PinCapabilities{}
+			continue
+		}
+		// Need at least two bytes for a (mode, resolution) pair.
+		if i+1 >= len(p) {
+			break
+		}
+		current[PinMode(p[i])] = p[i+1]
+		i++
+	}
+	return CapabilityResponse{Pins: pins}
+}
+
+// decodeAnalogMappingResponse parses an ANALOG_MAPPING_RESPONSE payload
+// (already stripped of leading 0x6A and trailing 0xF7). Each byte is the
+// analog channel for the matching digital pin, or 0x7F if not analog.
+func decodeAnalogMappingResponse(p []byte) AnalogMappingResponse {
+	out := make([]uint8, len(p))
+	copy(out, p)
+	return AnalogMappingResponse{ChannelByPin: out}
 }

@@ -269,6 +269,68 @@ func TestDecode_AnalogMessage_HighChannel(t *testing.T) {
 	}
 }
 
+func TestDecode_CapabilityResponse(t *testing.T) {
+	// Two pins worth of payload:
+	//   pin 0: INPUT (res 1), OUTPUT (res 1), terminator 0x7F
+	//   pin 1: PWM (res 8), terminator 0x7F
+	frame := []byte{
+		0xF0, 0x6C,
+		0x00, 0x01, // INPUT, 1 bit
+		0x01, 0x01, // OUTPUT, 1 bit
+		0x7F,
+		0x03, 0x08, // PWM, 8 bits
+		0x7F,
+		0xF7,
+	}
+	msg, err := decode(bufio.NewReader(bytes.NewReader(frame)))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	cr, ok := msg.(CapabilityResponse)
+	if !ok {
+		t.Fatalf("wanted CapabilityResponse, got %T", msg)
+	}
+	if len(cr.Pins) != 2 {
+		t.Fatalf("len(Pins) = %d, want 2", len(cr.Pins))
+	}
+	if cr.Pins[0][PinModeInput] != 1 || cr.Pins[0][PinModeOutput] != 1 {
+		t.Errorf("pin 0 caps = %v", cr.Pins[0])
+	}
+	if cr.Pins[1][PinModePWM] != 8 {
+		t.Errorf("pin 1 caps = %v", cr.Pins[1])
+	}
+}
+
+func TestDecode_AnalogMappingResponse(t *testing.T) {
+	// 4-pin map: pin 0 -> not analog (0x7F), pin 1 -> not analog,
+	//            pin 2 -> ch 0, pin 3 -> ch 1
+	frame := []byte{0xF0, 0x6A, 0x7F, 0x7F, 0x00, 0x01, 0xF7}
+	msg, err := decode(bufio.NewReader(bytes.NewReader(frame)))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	am, ok := msg.(AnalogMappingResponse)
+	if !ok {
+		t.Fatalf("wanted AnalogMappingResponse, got %T", msg)
+	}
+	want := []uint8{0x7F, 0x7F, 0x00, 0x01}
+	if !bytes.Equal(am.ChannelByPin, want) {
+		t.Errorf("got % X, want % X", am.ChannelByPin, want)
+	}
+}
+
+func TestDecode_UnknownSysexStillFallsThrough(t *testing.T) {
+	// REPORT_FIRMWARE-ish sysex (0x79) is not in our switch — must remain UnknownMessage.
+	frame := []byte{0xF0, 0x79, 0x02, 0x05, 0xF7}
+	msg, err := decode(bufio.NewReader(bytes.NewReader(frame)))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := msg.(UnknownMessage); !ok {
+		t.Fatalf("wanted UnknownMessage, got %T", msg)
+	}
+}
+
 func TestNewMessageTypes_ZeroValues(t *testing.T) {
 	var am AnalogMessage
 	if am.Channel != 0 || am.Value != 0 {
