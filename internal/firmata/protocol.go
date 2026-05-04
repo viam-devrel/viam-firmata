@@ -26,7 +26,10 @@ const (
 	sysexAnalogMappingResponse uint8 = 0x6A
 	sysexCapabilityQuery       uint8 = 0x6B
 	sysexCapabilityResponse    uint8 = 0x6C
+	sysexPinStateQuery         uint8 = 0x6D
+	sysexPinStateResponse      uint8 = 0x6E
 	sysexExtendedAnalog        uint8 = 0x6F
+	sysexStringData            uint8 = 0x71
 	sysexSamplingInterval      uint8 = 0x7A
 )
 
@@ -120,6 +123,10 @@ func encodeAnalogMappingQuery() []byte {
 	return []byte{cmdStartSysex, sysexAnalogMappingQuery, cmdEndSysex}
 }
 
+func encodePinStateQuery(pin uint8) []byte {
+	return []byte{cmdStartSysex, sysexPinStateQuery, pin & 0x7F, cmdEndSysex}
+}
+
 // Message is a decoded Firmata frame. Concrete types below.
 type Message interface{ isMessage() }
 
@@ -167,6 +174,26 @@ type AnalogMappingResponse struct {
 }
 
 func (AnalogMappingResponse) isMessage() {}
+
+// PinStateResponse is the decoded payload of a PIN_STATE_RESPONSE sysex —
+// the firmware's current view of one pin's mode and state. State width is
+// >= 7 bits, so the bytes are 7-bit packed lsb-first.
+type PinStateResponse struct {
+	Pin   uint8
+	Mode  PinMode
+	State uint32
+}
+
+func (PinStateResponse) isMessage() {}
+
+// StringDataMessage is the decoded payload of a STRING_DATA sysex (0x71).
+// ConfigurableFirmata uses this for diagnostic / error strings: each char is
+// sent as two 7-bit bytes (lsb, msb).
+type StringDataMessage struct {
+	Text string
+}
+
+func (StringDataMessage) isMessage() {}
 
 // UnknownMessage is returned for any command we don't explicitly handle,
 // including sysex. Callers can ignore it.
@@ -244,6 +271,10 @@ func decode(r *bufio.Reader) (Message, error) {
 			return decodeCapabilityResponse(payload[1:]), nil
 		case sysexAnalogMappingResponse:
 			return decodeAnalogMappingResponse(payload[1:]), nil
+		case sysexPinStateResponse:
+			return decodePinStateResponse(payload[1:]), nil
+		case sysexStringData:
+			return decodeStringData(payload[1:]), nil
 		default:
 			return UnknownMessage{Cmd: cmdStartSysex, Payload: payload}, nil
 		}
@@ -311,6 +342,38 @@ func decodeCapabilityResponse(p []byte) CapabilityResponse {
 		i++
 	}
 	return CapabilityResponse{Pins: pins}
+}
+
+// decodePinStateResponse parses a PIN_STATE_RESPONSE payload (already stripped
+// of the leading 0x6E sub-command and trailing 0xF7). Layout: pin, mode, then
+// 0..N 7-bit state bytes (lsb first).
+func decodePinStateResponse(p []byte) PinStateResponse {
+	if len(p) < 2 {
+		return PinStateResponse{}
+	}
+	resp := PinStateResponse{Pin: p[0], Mode: PinMode(p[1])}
+	var state uint32
+	for i, b := range p[2:] {
+		state |= uint32(b&0x7F) << (7 * uint(i))
+	}
+	resp.State = state
+	return resp
+}
+
+// decodeStringData parses a STRING_DATA payload (already stripped of the
+// leading 0x71 sub-command and trailing 0xF7). Each character is two 7-bit
+// bytes (lsb, msb); we collapse pairs and strip the trailing NUL the
+// firmware tends to append.
+func decodeStringData(p []byte) StringDataMessage {
+	out := make([]byte, 0, len(p)/2)
+	for i := 0; i+1 < len(p); i += 2 {
+		ch := byte((p[i] & 0x7F) | ((p[i+1] & 0x01) << 7))
+		if ch == 0 {
+			break
+		}
+		out = append(out, ch)
+	}
+	return StringDataMessage{Text: string(out)}
 }
 
 // decodeAnalogMappingResponse parses an ANALOG_MAPPING_RESPONSE payload

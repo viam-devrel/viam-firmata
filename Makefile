@@ -11,7 +11,7 @@ build:
 	$(GO) build -o $(BINARY) $(ENTRYPOINT)
 
 module.tar.gz: build
-	tar -czf module.tar.gz $(BINARY)
+	tar -czf module.tar.gz $(BINARY) meta.json
 
 test:
 	$(GO) test -race ./...

@@ -25,6 +25,8 @@ type Client struct {
 	version      chan VersionMessage
 	capabilities chan CapabilityResponse
 	analogMap    chan AnalogMappingResponse
+	pinStates    chan PinStateResponse
+	diagnostics  chan string
 	readErr      atomic.Pointer[error]
 	readerDone   chan struct{}
 	writeMu      sync.Mutex
@@ -40,6 +42,8 @@ func New(rw io.ReadWriteCloser) *Client {
 		version:      make(chan VersionMessage, 1),
 		capabilities: make(chan CapabilityResponse, 1),
 		analogMap:    make(chan AnalogMappingResponse, 1),
+		pinStates:    make(chan PinStateResponse, 4),
+		diagnostics:  make(chan string, 16),
 		readerDone:   make(chan struct{}),
 	}
 	go c.readLoop()
@@ -47,6 +51,11 @@ func New(rw io.ReadWriteCloser) *Client {
 }
 
 func (c *Client) Events() <-chan PinChange { return c.events }
+
+// Diagnostics emits firmware-side diagnostic strings (STRING_DATA sysex)
+// plus stringified summaries of any frames the decoder didn't recognize.
+// Drop-on-full: callers must drain promptly or messages are silently lost.
+func (c *Client) Diagnostics() <-chan string { return c.diagnostics }
 
 func (c *Client) Close() error {
 	if c.closed.Swap(true) {
@@ -65,6 +74,7 @@ func (c *Client) Close() error {
 func (c *Client) readLoop() {
 	defer close(c.readerDone)
 	defer close(c.events)
+	defer close(c.diagnostics)
 	for {
 		msg, err := decode(c.br)
 		if err != nil {
@@ -91,12 +101,25 @@ func (c *Client) readLoop() {
 			case c.analogMap <- m:
 			default:
 			}
+		case PinStateResponse:
+			select {
+			case c.pinStates <- m:
+			default:
+			}
+		case StringDataMessage:
+			select {
+			case c.diagnostics <- "string_data: " + m.Text:
+			default:
+			}
 		case DigitalPortMessage:
 			c.dispatchDigital(m)
 		case AnalogMessage:
 			c.dispatchAnalog(m)
 		case UnknownMessage:
-			// Ignore — sysex, analog reports we didn't subscribe to, etc.
+			select {
+			case c.diagnostics <- fmt.Sprintf("unknown frame cmd=0x%02X payload=% X", m.Cmd, m.Payload):
+			default:
+			}
 		}
 	}
 }
@@ -159,6 +182,28 @@ func (c *Client) QueryAnalogMapping(ctx context.Context) (AnalogMappingResponse,
 		return r, nil
 	case <-ctx.Done():
 		return AnalogMappingResponse{}, fmt.Errorf("analog mapping query: %w (no ANALOG_MAPPING_RESPONSE)", ctx.Err())
+	}
+}
+
+// QueryPinState sends a PIN_STATE_QUERY for the given digital pin and waits
+// for the matching response. The response carries the firmware's current
+// notion of the pin's mode and state — useful to verify a SetPinMode actually
+// took effect.
+func (c *Client) QueryPinState(ctx context.Context, pin int) (PinStateResponse, error) {
+	if pin < 0 || pin > 127 {
+		return PinStateResponse{}, fmt.Errorf("pin %d out of range", pin)
+	}
+	go func() { _ = c.writeFrame(encodePinStateQuery(uint8(pin))) }()
+	for {
+		select {
+		case r := <-c.pinStates:
+			if int(r.Pin) == pin {
+				return r, nil
+			}
+			// Different pin response (rare race with another query) — keep waiting.
+		case <-ctx.Done():
+			return PinStateResponse{}, fmt.Errorf("pin state query pin=%d: %w", pin, ctx.Err())
+		}
 	}
 }
 
