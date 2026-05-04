@@ -87,12 +87,56 @@ On other Linux systems, the path could look like:
 
 The following attributes are available for the board component:
 
-| Name                | Type     | Inclusion    | Description                                                                                                                                                                                                  |
-| ------------------- | -------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `serial_path`       | string   | **Required** | Path to the USB-serial device the Arduino enumerates as (see [Communication](#communication) below).                                                                                                         |
-| `baud_rate`         | int      | Optional     | Serial baud rate for communication with the Arduino. Default is `57600` to match ConfigurableFirmata's stock sketch.                                                                                          |
-| `auto_reset_delay`  | duration | Optional     | Time to wait after toggling DTR for the Arduino's bootloader to hand off to the sketch. Default is `2s`. Accepts any string parseable by [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration).      |
-| `handshake_timeout` | duration | Optional     | How long to wait for the Firmata `REPORT_VERSION` reply before giving up. Default is `5s`.                                                                                                                   |
+| Name                    | Type     | Inclusion    | Description                                                                                                                                                                                                  |
+| ----------------------- | -------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `serial_path`           | string   | **Required** | Path to the USB-serial device the Arduino enumerates as (see [Communication](#communication) below).                                                                                                         |
+| `baud_rate`             | int      | Optional     | Serial baud rate for communication with the Arduino. Default is `57600` to match ConfigurableFirmata's stock sketch.                                                                                          |
+| `auto_reset_delay`      | duration | Optional     | Time to wait after toggling DTR for the Arduino's bootloader to hand off to the sketch. Default is `2s`. Accepts any string parseable by [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration).      |
+| `handshake_timeout`     | duration | Optional     | How long to wait for the Firmata `REPORT_VERSION` reply before giving up. Default is `5s`.                                                                                                                   |
+| `sampling_interval_ms`  | int      | Optional     | Global firmware-side analog sampling interval in milliseconds (1..16383). When unset, the firmware default applies (typically 19ms on AVR). Applies to *all* enabled analog reports — Firmata has no per-pin rate. |
+| `analogs`               | array    | Optional     | List of analog reader declarations — see [Analog readers](#analog-readers) below. Each entry has `name` (used by `AnalogByName`) and `pin` (`"A0"`-style or a raw digital-pin number).                         |
+| `enable_diagnostics`    | bool     | Optional     | When true, emits firmware capability dumps and per-pin state probes after `SetPWM`/first analog `Read` at Debug level, and forwards firmware `STRING_DATA` messages at Warn level. Off by default.                |
+
+### Analog readers
+
+Declare each analog input you want exposed to Viam as an entry in `analogs`:
+
+```json
+{
+  "serial_path": "/dev/tty.usbmodem14201",
+  "sampling_interval_ms": 50,
+  "analogs": [
+    { "name": "joy_x", "pin": "A0" },
+    { "name": "thermistor", "pin": "15" }
+  ]
+}
+```
+
+`pin` accepts either the silkscreen alias (`"A0"`, `"A1"`, ...) or the raw
+digital-pin number (`"14"` is the same as `"A0"` on an Uno). On first `Read`,
+the module sends `SET_PIN_MODE(ANALOG)` and `REPORT_ANALOG`; subsequent
+`Read` calls return the cached 10-bit value (`Min=0`, `Max=1023`,
+`StepSize=5/1024 V`).
+
+A pin declared in `analogs` is *owned* by that reader: calling
+`GPIOPinByName(...).Set/Get/SetPWM` on it returns a clear error rather than
+silently flipping the pin out of analog mode. Choose a different pin if you
+need it as a GPIO.
+
+> **Note:** the `samples_per_sec` field on individual `analogs[]` entries is
+> accepted for forward compatibility with the Viam `AnalogReaderConfig`
+> schema, but it is **ignored** — Firmata only supports the global
+> `sampling_interval_ms` setting above.
+
+### PWM
+
+Any pin advertised as PWM-capable in the firmware's `CAPABILITY_RESPONSE`
+can be driven via `GPIOPinByName(name).SetPWM(ctx, duty, nil)` — duty is a
+float in `0.0..1.0`. The current duty is cached and returned by `PWM(ctx, nil)`.
+
+PWM frequency on standard ConfigurableFirmata builds is fixed by the
+Arduino's hardware timers (~490 Hz on most pins, ~980 Hz on timer-1 pins).
+`PWMFreq`/`SetPWMFreq` return an "unimplemented" error.
 
 ## Development
 
@@ -120,7 +164,11 @@ make build
       "api": "rdk:component:board",
       "model": "devrel:firmata:board",
       "attributes": {
-        "serial_path": "/dev/tty.usbmodem14201"
+        "serial_path": "/dev/tty.usbmodem14201",
+        "sampling_interval_ms": 50,
+        "analogs": [
+          { "name": "joy_x", "pin": "A0" }
+        ]
       }
     }
   ]
@@ -159,19 +207,23 @@ COM1
 Or use `arduino-cli board list` to print the port and FQBN of every connected
 Arduino.
 
-### Scope (v1)
+### Scope
 
-This release supports **digital GPIO only**. The following board API methods
-return an "unimplemented" error and will surface as configuration or runtime
-errors if you try to use them:
+This release supports **digital GPIO**, **analog reads**, and **PWM**. The
+following board API methods still return an "unimplemented" error and will
+surface as configuration or runtime errors if you try to use them:
 
-- Analog reads (`AnalogByName`)
-- PWM (`SetPWM`, `PWMFreq`, `SetPWMFreq`)
 - Digital interrupts (`DigitalInterruptByName`, `StreamTicks`)
+- PWM frequency control (`PWMFreq`, `SetPWMFreq`) — Firmata has no spec for
+  runtime frequency control. Most AVR PWM pins run at ~490 Hz; some timer-1
+  pins run at ~980 Hz. If you need a specific frequency, you'll have to
+  patch the Firmata sketch on the Arduino side.
 - Power-mode control (`SetPowerMode`)
 
-Use `GPIOPinByName(name).Set(ctx, high, …)` and `.Get(ctx, …)` — pin names are
-the digital pin numbers as strings (`"2"`, `"13"`, …).
+Use `GPIOPinByName(name).Set(ctx, high, ...)` / `.Get(ctx, ...)` /
+`.SetPWM(ctx, duty, ...)` — pin names are the digital pin numbers as strings
+(`"2"`, `"13"`, ...). Use `AnalogByName(name)` for analog readers declared in
+the `analogs[]` config.
 
 ## Troubleshooting
 
@@ -221,3 +273,5 @@ go test -race ./...
 
 - Spec: [`docs/superpowers/specs/2026-04-21-viam-firmata-poc-design.md`](docs/superpowers/specs/2026-04-21-viam-firmata-poc-design.md)
 - Plan: [`docs/superpowers/plans/2026-04-21-viam-firmata-poc.md`](docs/superpowers/plans/2026-04-21-viam-firmata-poc.md)
+- Spec (analog + PWM): [`docs/superpowers/specs/2026-04-28-viam-firmata-analog-pwm-design.md`](docs/superpowers/specs/2026-04-28-viam-firmata-analog-pwm-design.md)
+- Plan (analog + PWM): [`docs/superpowers/plans/2026-04-28-viam-firmata-analog-pwm.md`](docs/superpowers/plans/2026-04-28-viam-firmata-analog-pwm.md)

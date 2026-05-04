@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.bug.st/serial"
@@ -30,10 +33,13 @@ var errUnimplemented = errors.New("firmata board: method not implemented")
 
 // Config is the attributes block for a devrel:firmata:board component.
 type Config struct {
-	SerialPath       string        `json:"serial_path"`
-	BaudRate         int           `json:"baud_rate,omitempty"`
-	AutoResetDelay   time.Duration `json:"auto_reset_delay,omitempty"`
-	HandshakeTimeout time.Duration `json:"handshake_timeout,omitempty"`
+	SerialPath         string                     `json:"serial_path"`
+	BaudRate           int                        `json:"baud_rate,omitempty"`
+	AutoResetDelay     time.Duration              `json:"auto_reset_delay,omitempty"`
+	HandshakeTimeout   time.Duration              `json:"handshake_timeout,omitempty"`
+	SamplingIntervalMs int                        `json:"sampling_interval_ms,omitempty"`
+	Analogs            []board.AnalogReaderConfig `json:"analogs,omitempty"`
+	EnableDiagnostics  bool                       `json:"enable_diagnostics,omitempty"`
 }
 
 // Validate checks required fields and reports that this board has no resource
@@ -45,6 +51,32 @@ func (c *Config) Validate(path string) ([]string, []string, error) {
 	if c.BaudRate < 0 {
 		return nil, nil, resource.NewConfigValidationError(path,
 			fmt.Errorf("baud_rate must be >= 0"))
+	}
+	if c.SamplingIntervalMs < 0 || c.SamplingIntervalMs > 16383 {
+		return nil, nil, resource.NewConfigValidationError(path,
+			fmt.Errorf("sampling_interval_ms must be 0..16383"))
+	}
+
+	seenName := map[string]bool{}
+	seenPin := map[string]bool{}
+	for i, a := range c.Analogs {
+		sub := fmt.Sprintf("%s.analogs.%d", path, i)
+		if err := a.Validate(sub); err != nil {
+			return nil, nil, err
+		}
+		if seenName[a.Name] {
+			return nil, nil, resource.NewConfigValidationError(sub,
+				fmt.Errorf("duplicate analog name %q", a.Name))
+		}
+		if seenPin[a.Pin] {
+			return nil, nil, resource.NewConfigValidationError(sub,
+				fmt.Errorf("pin %q declared in multiple analogs entries", a.Pin))
+		}
+		if _, _, err := parseAnalogPin(a.Pin); err != nil {
+			return nil, nil, resource.NewConfigValidationError(sub, err)
+		}
+		seenName[a.Name] = true
+		seenPin[a.Pin] = true
 	}
 	return nil, nil, nil
 }
@@ -69,6 +101,35 @@ type firmataBoard struct {
 	// finer-grained concurrency if this becomes a bottleneck.
 	mu       sync.Mutex
 	pinModes map[int]firmata.PinMode
+
+	// Capability data populated in NewBoard right after handshake.
+	capabilities firmata.CapabilityResponse
+	analogMap    firmata.AnalogMappingResponse
+
+	// analogs is the set of declared analog readers, keyed by their config
+	// name. ownedPins maps each digital pin used by a declared analog back
+	// to that analog's name so GPIOPinByName(...).Set/Get can refuse it.
+	analogs   map[string]*firmataAnalog
+	ownedPins map[int]string
+
+	// pwmDuty is the last duty value written to each pin via SetPWM. Read
+	// back by PWM(). Guarded by mu.
+	pwmDuty map[int]float64
+
+	// diagnostics, when true, gates all opt-in diagnostic surfaces:
+	//   - the one-shot logCapabilities dump in initializeAnalogs,
+	//   - the PIN_STATE_QUERY probes in SetPWM and firmataAnalog.Read
+	//     (first-enable),
+	//   - the drainDiagnostics goroutine that surfaces firmware
+	//     STRING_DATA messages.
+	// NewBoard sets this from cfg.EnableDiagnostics (default off); unit
+	// tests using newBoardFromClient leave it off so they don't have to
+	// mock PIN_STATE_RESPONSE or run the diagnostics drain.
+	diagnostics bool
+
+	// diagDone is closed by drainDiagnostics on exit. Only initialized
+	// (and only waited on by Close) when diagnostics is true.
+	diagDone chan struct{}
 }
 
 // newBoardFromClient wires a *firmata.Client (and the io.Closer that owns the
@@ -83,9 +144,24 @@ func newBoardFromClient(name resource.Name, c *firmata.Client, closer io.Closer,
 		client:    c,
 		drainDone: make(chan struct{}),
 		pinModes:  make(map[int]firmata.PinMode),
+		analogs:   map[string]*firmataAnalog{},
+		ownedPins: map[int]string{},
+		pwmDuty:   map[int]float64{},
 	}
 	go b.drainEvents()
 	return b
+}
+
+// drainDiagnostics surfaces firmware-side STRING_DATA messages and any
+// otherwise-unrecognized frames into the viam logger. ConfigurableFirmata
+// uses STRING_DATA for warnings (e.g. "PIN x IS NOT SUPPORTED FOR MODE y") so
+// these are gold for figuring out why a SetPinMode appears to no-op.
+// Closes b.diagDone on exit so Close() can wait for it.
+func (b *firmataBoard) drainDiagnostics() {
+	defer close(b.diagDone)
+	for s := range b.client.Diagnostics() {
+		b.logger.Warnf("firmata board: firmware diag: %s", s)
+	}
 }
 
 // drainEvents consumes and discards Client.Events() so the reader goroutine
@@ -98,11 +174,14 @@ func (b *firmataBoard) drainEvents() {
 }
 
 // Close tears down the client and the underlying transport and waits for the
-// drain goroutine to exit. Idempotent.
+// drain goroutines to exit. Idempotent.
 func (b *firmataBoard) Close(_ context.Context) error {
 	b.closeOnce.Do(func() {
-		b.closeErr = b.client.Close() // unblocks reader → closes events → drain exits
+		b.closeErr = b.client.Close() // unblocks reader → closes events/diagnostics → drains exit
 		<-b.drainDone
+		if b.diagnostics {
+			<-b.diagDone
+		}
 		if cerr := b.closer.Close(); b.closeErr == nil {
 			b.closeErr = cerr
 		}
@@ -145,6 +224,9 @@ func (p *firmataGPIOPin) ensureMode(mode firmata.PinMode) error {
 }
 
 func (p *firmataGPIOPin) Set(_ context.Context, high bool, _ map[string]any) error {
+	if owner, taken := p.board.ownedPins[p.pin]; taken {
+		return fmt.Errorf("firmata board: pin %d is owned by analog %q", p.pin, owner)
+	}
 	if err := p.ensureMode(firmata.PinModeOutput); err != nil {
 		return err
 	}
@@ -156,28 +238,73 @@ func (p *firmataGPIOPin) Set(_ context.Context, high bool, _ map[string]any) err
 // reader goroutine. No I/O happens on subsequent calls once the pin mode is
 // cached.
 func (p *firmataGPIOPin) Get(_ context.Context, _ map[string]any) (bool, error) {
+	if owner, taken := p.board.ownedPins[p.pin]; taken {
+		return false, fmt.Errorf("firmata board: pin %d is owned by analog %q", p.pin, owner)
+	}
 	if err := p.ensureMode(firmata.PinModeInputPullup); err != nil {
 		return false, err
 	}
 	return p.board.client.ReadDigital(p.pin), nil
 }
 
-// PWM is intentionally unimplemented in v1; PWM support is out of scope.
+func (p *firmataGPIOPin) SetPWM(ctx context.Context, dutyCyclePct float64, _ map[string]any) error {
+	if owner, taken := p.board.ownedPins[p.pin]; taken {
+		return fmt.Errorf("firmata board: pin %d is owned by analog %q", p.pin, owner)
+	}
+	duty, err := board.ValidatePWMDutyCycle(dutyCyclePct)
+	if err != nil {
+		return err
+	}
+	if !p.board.pinSupports(p.pin, firmata.PinModePWM) {
+		return fmt.Errorf("firmata board: pin %d does not support PWM", p.pin)
+	}
+	if err := p.ensureMode(firmata.PinModePWM); err != nil {
+		return err
+	}
+	value := uint16(duty * 255)
+	if p.board.diagnostics {
+		p.board.logger.Debugf("firmata board: SetPWM pin=%d duty=%.3f -> raw=%d", p.pin, duty, value)
+	}
+	if err := p.board.client.AnalogWrite(p.pin, value); err != nil {
+		return err
+	}
+	p.board.mu.Lock()
+	p.board.pwmDuty[p.pin] = duty
+	p.board.mu.Unlock()
+	if p.board.diagnostics {
+		p.probePinState(ctx, "SetPWM")
+	}
+	return nil
+}
+
+// probePinState queries the firmware for the pin's current mode/state and
+// logs the result. Diagnostic-only; failures are logged but not surfaced.
+func (p *firmataGPIOPin) probePinState(ctx context.Context, label string) {
+	qctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	r, err := p.board.client.QueryPinState(qctx, p.pin)
+	if err != nil {
+		p.board.logger.Warnf("firmata board: %s probe: pin %d state query failed: %v", label, p.pin, err)
+		return
+	}
+	p.board.logger.Debugf("firmata board: %s probe: pin %d firmware-mode=0x%02X (%s) state=%d",
+		label, p.pin, uint8(r.Mode), pinModeName(r.Mode), r.State)
+}
+
 func (p *firmataGPIOPin) PWM(_ context.Context, _ map[string]any) (float64, error) {
-	return 0, errUnimplemented
+	p.board.mu.Lock()
+	defer p.board.mu.Unlock()
+	return p.board.pwmDuty[p.pin], nil
 }
 
-// SetPWM is intentionally unimplemented in v1; PWM support is out of scope.
-func (p *firmataGPIOPin) SetPWM(_ context.Context, _ float64, _ map[string]any) error {
-	return errUnimplemented
-}
-
-// PWMFreq is intentionally unimplemented in v1; PWM support is out of scope.
+// PWMFreq is intentionally unimplemented; the Firmata wire protocol has no
+// spec for runtime per-pin frequency control.
 func (p *firmataGPIOPin) PWMFreq(_ context.Context, _ map[string]any) (uint, error) {
 	return 0, errUnimplemented
 }
 
-// SetPWMFreq is intentionally unimplemented in v1; PWM support is out of scope.
+// SetPWMFreq is intentionally unimplemented; the Firmata wire protocol has no
+// spec for runtime per-pin frequency control.
 func (p *firmataGPIOPin) SetPWMFreq(_ context.Context, _ uint, _ map[string]any) error {
 	return errUnimplemented
 }
@@ -232,8 +359,8 @@ func NewBoard(ctx context.Context, _ resource.Dependencies, conf resource.Config
 	c := firmata.New(sp)
 
 	hsCtx, cancel := context.WithTimeout(ctx, hsTimeout)
+	defer cancel()
 	major, minor, err := c.Handshake(hsCtx)
-	cancel()
 	if err != nil {
 		_ = c.Close()
 		_ = sp.Close()
@@ -241,13 +368,27 @@ func NewBoard(ctx context.Context, _ resource.Dependencies, conf resource.Config
 	}
 	logger.Infof("firmata board: connected to %s — firmware v%d.%d", cfg.SerialPath, major, minor)
 
-	return newBoardFromClient(conf.ResourceName(), c, sp, logger), nil
+	b := newBoardFromClient(conf.ResourceName(), c, sp, logger)
+	b.diagnostics = cfg.EnableDiagnostics
+	if b.diagnostics {
+		b.diagDone = make(chan struct{})
+		go b.drainDiagnostics()
+	}
+	if err := b.initializeAnalogs(hsCtx, cfg); err != nil {
+		_ = b.Close(ctx)
+		return nil, fmt.Errorf("init on %s: %w", cfg.SerialPath, err)
+	}
+	return b, nil
 }
 
 // --- Board-level methods outside the v1 digital-GPIO scope ---
 
-func (b *firmataBoard) AnalogByName(string) (board.Analog, error) {
-	return nil, errUnimplemented
+func (b *firmataBoard) AnalogByName(name string) (board.Analog, error) {
+	a, ok := b.analogs[name]
+	if !ok {
+		return nil, fmt.Errorf("firmata board: no analog named %q", name)
+	}
+	return a, nil
 }
 
 func (b *firmataBoard) DigitalInterruptByName(string) (board.DigitalInterrupt, error) {
@@ -260,6 +401,233 @@ func (b *firmataBoard) SetPowerMode(_ context.Context, _ pb.PowerMode, _ *time.D
 
 func (b *firmataBoard) StreamTicks(_ context.Context, _ []board.DigitalInterrupt, _ chan board.Tick, _ map[string]any) error {
 	return errUnimplemented
+}
+
+// parseAnalogPin accepts "A0".."A15" or a raw digital pin number "0".."127".
+// The unknown side of the pair is returned as the sentinel -1; resolveAnalogPin
+// (called in NewBoard against the analog-mapping response) fills it in:
+//
+//	"A3"  -> (digitalPin: -1, analogChannel: 3)
+//	"14"  -> (digitalPin: 14, analogChannel: -1)
+func parseAnalogPin(s string) (digitalPin int, analogChannel int, err error) {
+	if s == "" {
+		return -1, -1, fmt.Errorf("analog pin name is empty")
+	}
+	if s[0] == 'A' || s[0] == 'a' {
+		n, err := strconv.Atoi(s[1:])
+		if err != nil || n < 0 || n > 15 {
+			return -1, -1, fmt.Errorf("invalid analog pin %q (want \"A0\".. \"A15\")", s)
+		}
+		return -1, n, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 || n > 127 {
+		return -1, -1, fmt.Errorf("invalid analog pin %q (want \"A0\".. \"A15\" or 0..127)", s)
+	}
+	return n, -1, nil
+}
+
+// firmataAnalog implements board.Analog over a firmata.Client. Lazily
+// configures the pin and enables reporting on first Read; subsequent reads
+// return the cached value from Client.analogState.
+type firmataAnalog struct {
+	board      *firmataBoard
+	name       string
+	digitalPin int
+	channel    uint8
+	enableOnce sync.Once
+	enableErr  atomic.Pointer[error]
+}
+
+func (a *firmataAnalog) Read(ctx context.Context, _ map[string]any) (board.AnalogValue, error) {
+	a.enableOnce.Do(func() {
+		if err := a.board.client.SetPinMode(a.digitalPin, firmata.PinModeAnalog); err != nil {
+			a.enableErr.Store(&err)
+			return
+		}
+		if err := a.board.client.EnableAnalogReporting(int(a.channel), true); err != nil {
+			a.enableErr.Store(&err)
+			return
+		}
+		a.board.mu.Lock()
+		a.board.pinModes[a.digitalPin] = firmata.PinModeAnalog
+		a.board.mu.Unlock()
+		if a.board.diagnostics {
+			qctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			defer cancel()
+			if r, err := a.board.client.QueryPinState(qctx, a.digitalPin); err != nil {
+				a.board.logger.Warnf("firmata board: analog %q (pin %d, ch %d) state query failed: %v",
+					a.name, a.digitalPin, a.channel, err)
+			} else {
+				a.board.logger.Debugf("firmata board: analog %q (pin %d, ch %d) firmware-mode=0x%02X (%s) state=%d",
+					a.name, a.digitalPin, a.channel, uint8(r.Mode), pinModeName(r.Mode), r.State)
+			}
+		}
+	})
+	// enableErr is set once inside enableOnce.Do and never cleared, so
+	// subsequent Reads return the same cached error rather than retrying
+	// mid-traffic.
+	if errp := a.enableErr.Load(); errp != nil {
+		return board.AnalogValue{}, *errp
+	}
+	return board.AnalogValue{
+		Value:    int(a.board.client.ReadAnalog(int(a.channel))),
+		Min:      0,
+		Max:      1023,
+		StepSize: 5.0 / 1024,
+	}, nil
+}
+
+func (a *firmataAnalog) Write(_ context.Context, _ int, _ map[string]any) error {
+	return errUnimplemented
+}
+
+// initializeAnalogs runs the post-handshake board setup: capability query,
+// analog-mapping query, optional SAMPLING_INTERVAL emit, and then builds
+// the analogs / ownedPins maps from cfg.Analogs.
+//
+// On any error the board is left in a partially-initialized state — caller
+// is responsible for calling Close(). This is the single source of truth
+// for the analog initialization sequence: NewBoard and the test harness
+// both call it so a single edit point gates both production and tests.
+func (b *firmataBoard) initializeAnalogs(ctx context.Context, cfg *Config) error {
+	caps, err := b.client.QueryCapabilities(ctx)
+	if err != nil {
+		return fmt.Errorf("capability query: %w", err)
+	}
+	amap, err := b.client.QueryAnalogMapping(ctx)
+	if err != nil {
+		return fmt.Errorf("analog mapping query: %w", err)
+	}
+
+	if cfg.SamplingIntervalMs > 0 {
+		if err := b.client.SetSamplingInterval(cfg.SamplingIntervalMs); err != nil {
+			return fmt.Errorf("set sampling interval: %w", err)
+		}
+	}
+
+	b.capabilities = caps
+	b.analogMap = amap
+
+	if b.diagnostics {
+		logCapabilities(b.logger, caps, amap)
+	}
+
+	for _, ac := range cfg.Analogs {
+		dpin, ch, err := parseAnalogPin(ac.Pin)
+		if err != nil {
+			return fmt.Errorf("analog %q: %w", ac.Name, err)
+		}
+		dpin, ch, err = resolveAnalogPin(dpin, ch, amap)
+		if err != nil {
+			return fmt.Errorf("analog %q: %w", ac.Name, err)
+		}
+		if !b.pinSupports(dpin, firmata.PinModeAnalog) {
+			return fmt.Errorf("analog %q: pin %d does not support analog mode", ac.Name, dpin)
+		}
+		if ac.SamplesPerSecond != 0 {
+			b.logger.Warnf("firmata board: analog %q samples_per_sec=%d ignored — Firmata only supports a global sampling_interval_ms",
+				ac.Name, ac.SamplesPerSecond)
+		}
+		b.analogs[ac.Name] = &firmataAnalog{
+			board: b, name: ac.Name, digitalPin: dpin, channel: uint8(ch),
+		}
+		b.ownedPins[dpin] = ac.Name
+		b.logger.Debugf("firmata board: analog %q resolved to digital pin %d, channel %d",
+			ac.Name, dpin, ch)
+	}
+
+	return nil
+}
+
+// logCapabilities is a diagnostic-only one-shot dump of what the firmware
+// advertised: per-pin (mode, resolution) pairs and the analog-mapping table.
+// Used to verify that hardcoded assumptions in this module (e.g. 8-bit PWM,
+// 10-bit ADC, A0 == channel 0) match what's actually on the wire. The caller
+// (initializeAnalogs) gates this behind b.diagnostics, so it only runs when
+// the operator opted in via cfg.EnableDiagnostics.
+func logCapabilities(logger logging.Logger, caps firmata.CapabilityResponse, amap firmata.AnalogMappingResponse) {
+	logger.Debugf("firmata board: capability response: %d pins", len(caps.Pins))
+	for i, p := range caps.Pins {
+		if len(p) == 0 {
+			continue
+		}
+		modes := make([]int, 0, len(p))
+		for m := range p {
+			modes = append(modes, int(m))
+		}
+		sort.Ints(modes)
+		parts := make([]string, 0, len(modes))
+		for _, m := range modes {
+			parts = append(parts, fmt.Sprintf("%s@%db", pinModeName(firmata.PinMode(m)), p[firmata.PinMode(m)]))
+		}
+		logger.Debugf("firmata board:   pin %d: %s", i, strings.Join(parts, ", "))
+	}
+	logger.Debugf("firmata board: analog mapping (digital pin -> channel, 0x7F=none): %v", amap.ChannelByPin)
+}
+
+func pinModeName(m firmata.PinMode) string {
+	switch m {
+	case firmata.PinModeInput:
+		return "INPUT"
+	case firmata.PinModeOutput:
+		return "OUTPUT"
+	case firmata.PinModeAnalog:
+		return "ANALOG"
+	case firmata.PinModePWM:
+		return "PWM"
+	case firmata.PinModeServo:
+		return "SERVO"
+	case firmata.PinModeI2C:
+		return "I2C"
+	case firmata.PinModeInputPullup:
+		return "INPUT_PULLUP"
+	default:
+		return fmt.Sprintf("MODE_0x%02X", uint8(m))
+	}
+}
+
+// pinSupports reports whether the firmware advertises the given mode for
+// the pin. Returns false if the pin is out of the capability map or the
+// capability table is empty (e.g. before handshake-time discovery has
+// populated it; tests that bypass NewBoard need to inject capabilities
+// explicitly).
+func (b *firmataBoard) pinSupports(pin int, mode firmata.PinMode) bool {
+	if pin < 0 || pin >= len(b.capabilities.Pins) {
+		return false
+	}
+	caps := b.capabilities.Pins[pin]
+	_, ok := caps[mode]
+	return ok
+}
+
+// resolveAnalogPin fills in whichever side of the (digitalPin, analogChannel)
+// pair was left as the -1 sentinel by parseAnalogPin, using the analog mapping
+// reported by the firmware. Returns an error if the pin/channel doesn't appear
+// in the mapping.
+func resolveAnalogPin(digitalPin, analogChannel int, amap firmata.AnalogMappingResponse) (int, int, error) {
+	switch {
+	case digitalPin >= 0 && analogChannel == -1:
+		// Digital -> channel.
+		if digitalPin >= len(amap.ChannelByPin) {
+			return 0, 0, fmt.Errorf("pin %d out of range of analog mapping (len=%d)", digitalPin, len(amap.ChannelByPin))
+		}
+		ch := amap.ChannelByPin[digitalPin]
+		if ch == 0x7F {
+			return 0, 0, fmt.Errorf("pin %d is not analog-capable", digitalPin)
+		}
+		return digitalPin, int(ch), nil
+	case digitalPin == -1 && analogChannel >= 0:
+		// Channel -> digital pin: linear scan, mappings are short.
+		for i, ch := range amap.ChannelByPin {
+			if int(ch) == analogChannel {
+				return i, analogChannel, nil
+			}
+		}
+		return 0, 0, fmt.Errorf("analog channel %d not advertised by firmware", analogChannel)
+	default:
+		return 0, 0, fmt.Errorf("resolveAnalogPin: invalid input (digitalPin=%d, channel=%d)", digitalPin, analogChannel)
+	}
 }
 
 // Compile-time assertions that our types satisfy the full board interfaces.

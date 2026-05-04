@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -105,6 +107,28 @@ func (f *rwFake) Read(p []byte) (int, error)  { return f.r.Read(p) }
 func (f *rwFake) Write(p []byte) (int, error) { return f.w.Write(p) }
 func (f *rwFake) Close() error                { return nil }
 
+// syncBuf is a mutex-protected bytes.Buffer for use in tests where multiple
+// goroutines may write concurrently (e.g. the fire-and-forget write goroutines
+// inside QueryCapabilities / QueryAnalogMapping).
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuf) Bytes() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := make([]byte, s.buf.Len())
+	copy(b, s.buf.Bytes())
+	return b
+}
+
 func TestGPIOPin_Set_EmitsPinModeOnceThenDigitalWrites(t *testing.T) {
 	tb := newTestBoard(t)
 	defer tb.cleanup()
@@ -203,14 +227,9 @@ func TestUnimplementedMethods_ReturnSentinelError(t *testing.T) {
 	defer tb.cleanup()
 	ctx := context.Background()
 
-	// GPIOPin PWM family.
+	// PWM frequency control is genuinely unimplemented — Firmata has no
+	// runtime-frequency wire spec.
 	pin, _ := tb.b.GPIOPinByName("5")
-	if _, err := pin.PWM(ctx, nil); !errors.Is(err, errUnimplemented) {
-		t.Errorf("PWM: want errUnimplemented, got %v", err)
-	}
-	if err := pin.SetPWM(ctx, 0.5, nil); !errors.Is(err, errUnimplemented) {
-		t.Errorf("SetPWM: want errUnimplemented, got %v", err)
-	}
 	if _, err := pin.PWMFreq(ctx, nil); !errors.Is(err, errUnimplemented) {
 		t.Errorf("PWMFreq: want errUnimplemented, got %v", err)
 	}
@@ -218,13 +237,12 @@ func TestUnimplementedMethods_ReturnSentinelError(t *testing.T) {
 		t.Errorf("SetPWMFreq: want errUnimplemented, got %v", err)
 	}
 
-	// Board-level.
-	if _, err := tb.b.AnalogByName("a0"); !errors.Is(err, errUnimplemented) {
-		t.Errorf("AnalogByName: want errUnimplemented, got %v", err)
-	}
+	// Digital interrupts ship in a separate spec; today they remain unimplemented.
 	if _, err := tb.b.DigitalInterruptByName("d0"); !errors.Is(err, errUnimplemented) {
 		t.Errorf("DigitalInterruptByName: want errUnimplemented, got %v", err)
 	}
+
+	// SetPowerMode and StreamTicks remain explicit non-goals.
 	if err := tb.b.SetPowerMode(ctx, 0, nil, nil); !errors.Is(err, errUnimplemented) {
 		t.Errorf("SetPowerMode: want errUnimplemented, got %v", err)
 	}
@@ -240,6 +258,397 @@ func TestGPIOPinByName_RejectsInvalid(t *testing.T) {
 		if _, err := tb.b.GPIOPinByName(name); err == nil {
 			t.Errorf("GPIOPinByName(%q): want error, got nil", name)
 		}
+	}
+}
+
+func TestConfig_Validate_Analogs(t *testing.T) {
+	t.Run("accepts well-formed analogs", func(t *testing.T) {
+		c := &Config{
+			SerialPath: "/dev/null",
+			Analogs: []board.AnalogReaderConfig{
+				{Name: "joy_x", Pin: "A0"},
+				{Name: "joy_y", Pin: "15"},
+			},
+		}
+		if _, _, err := c.Validate("components.0"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("rejects duplicate analog name", func(t *testing.T) {
+		c := &Config{
+			SerialPath: "/dev/null",
+			Analogs: []board.AnalogReaderConfig{
+				{Name: "joy", Pin: "A0"},
+				{Name: "joy", Pin: "A1"},
+			},
+		}
+		if _, _, err := c.Validate("components.0"); err == nil {
+			t.Fatal("expected error for duplicate analog name")
+		}
+	})
+
+	t.Run("rejects duplicate analog pin literal", func(t *testing.T) {
+		c := &Config{
+			SerialPath: "/dev/null",
+			Analogs: []board.AnalogReaderConfig{
+				{Name: "x", Pin: "A0"},
+				{Name: "y", Pin: "A0"},
+			},
+		}
+		if _, _, err := c.Validate("components.0"); err == nil {
+			t.Fatal("expected error for duplicate analog pin")
+		}
+	})
+
+	t.Run("rejects malformed pin string", func(t *testing.T) {
+		c := &Config{
+			SerialPath: "/dev/null",
+			Analogs: []board.AnalogReaderConfig{
+				{Name: "bad", Pin: "Z9"},
+			},
+		}
+		if _, _, err := c.Validate("components.0"); err == nil {
+			t.Fatal("expected error for malformed pin")
+		}
+	})
+
+	t.Run("rejects empty pin", func(t *testing.T) {
+		c := &Config{
+			SerialPath: "/dev/null",
+			Analogs: []board.AnalogReaderConfig{
+				{Name: "bad", Pin: ""},
+			},
+		}
+		if _, _, err := c.Validate("components.0"); err == nil {
+			t.Fatal("expected error for empty pin")
+		}
+	})
+
+	t.Run("rejects sampling_interval_ms out of range", func(t *testing.T) {
+		c := &Config{SerialPath: "/dev/null", SamplingIntervalMs: -1}
+		if _, _, err := c.Validate("components.0"); err == nil {
+			t.Fatal("expected error for negative sampling_interval_ms")
+		}
+		c = &Config{SerialPath: "/dev/null", SamplingIntervalMs: 16384}
+		if _, _, err := c.Validate("components.0"); err == nil {
+			t.Fatal("expected error for sampling_interval_ms > 16383")
+		}
+	})
+}
+
+// unoCaps returns a CapabilityResponse shaped like an Arduino Uno running
+// StandardFirmataPlus: 14 digital pins (0..13), of which 3, 5, 6, 9, 10, 11
+// support PWM, plus 6 analog pins (14..19) that support analog input. Pin 1
+// (RX) and pin 0 (TX) are also INPUT/OUTPUT-capable but kept simple here.
+func unoCaps() firmata.CapabilityResponse {
+	pins := make([]firmata.PinCapabilities, 20)
+	pwm := map[int]bool{3: true, 5: true, 6: true, 9: true, 10: true, 11: true}
+	for i := 0; i < 14; i++ {
+		caps := firmata.PinCapabilities{
+			firmata.PinModeInput:       1,
+			firmata.PinModeOutput:      1,
+			firmata.PinModeInputPullup: 1,
+		}
+		if pwm[i] {
+			caps[firmata.PinModePWM] = 8
+		}
+		pins[i] = caps
+	}
+	for i := 14; i < 20; i++ {
+		pins[i] = firmata.PinCapabilities{
+			firmata.PinModeInput:       1,
+			firmata.PinModeOutput:      1,
+			firmata.PinModeInputPullup: 1,
+			firmata.PinModeAnalog:      10,
+		}
+	}
+	return firmata.CapabilityResponse{Pins: pins}
+}
+
+// unoAnalogMap returns the analog mapping table for an Uno: digital pins
+// 0..13 are not analog (0x7F); pins 14..19 map to channels 0..5.
+func unoAnalogMap() firmata.AnalogMappingResponse {
+	channels := make([]uint8, 20)
+	for i := 0; i < 14; i++ {
+		channels[i] = 0x7F
+	}
+	for i := 14; i < 20; i++ {
+		channels[i] = uint8(i - 14)
+	}
+	return firmata.AnalogMappingResponse{ChannelByPin: channels}
+}
+
+// newTestBoardWithCaps builds a testBoard with the supplied capability +
+// analog-mapping data already injected, then registers each declared analog
+// against that mapping. It bypasses the Handshake / capability-query flow
+// the production NewBoard runs — call newConstructorTestBoard for tests
+// that need the full constructor path.
+func newTestBoardWithCaps(
+	t *testing.T,
+	caps firmata.CapabilityResponse,
+	amap firmata.AnalogMappingResponse,
+	analogs []board.AnalogReaderConfig,
+) *testBoard {
+	t.Helper()
+	tb := newTestBoard(t)
+	tb.b.capabilities = caps
+	tb.b.analogMap = amap
+	for _, a := range analogs {
+		dpin, ch, err := parseAnalogPin(a.Pin)
+		if err != nil {
+			t.Fatalf("parseAnalogPin(%q): %v", a.Pin, err)
+		}
+		dpin, ch, err = resolveAnalogPin(dpin, ch, amap)
+		if err != nil {
+			t.Fatalf("resolveAnalogPin(%q): %v", a.Pin, err)
+		}
+		tb.b.analogs[a.Name] = &firmataAnalog{
+			board:      tb.b,
+			name:       a.Name,
+			digitalPin: dpin,
+			channel:    uint8(ch),
+		}
+		tb.b.ownedPins[dpin] = a.Name
+	}
+	return tb
+}
+
+func TestResolveAnalogPin(t *testing.T) {
+	amap := unoAnalogMap()
+
+	t.Run("A0 maps to digital pin 14", func(t *testing.T) {
+		dpin, ch, err := resolveAnalogPin(-1, 0, amap)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if dpin != 14 || ch != 0 {
+			t.Errorf("got (%d, %d), want (14, 0)", dpin, ch)
+		}
+	})
+
+	t.Run("digital 14 maps to channel 0", func(t *testing.T) {
+		dpin, ch, err := resolveAnalogPin(14, -1, amap)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if dpin != 14 || ch != 0 {
+			t.Errorf("got (%d, %d), want (14, 0)", dpin, ch)
+		}
+	})
+
+	t.Run("non-analog digital pin fails", func(t *testing.T) {
+		if _, _, err := resolveAnalogPin(13, -1, amap); err == nil {
+			t.Errorf("expected error for non-analog pin")
+		}
+	})
+
+	t.Run("unknown channel fails", func(t *testing.T) {
+		if _, _, err := resolveAnalogPin(-1, 9, amap); err == nil {
+			t.Errorf("expected error for unmapped channel")
+		}
+	})
+}
+
+func TestAnalogRead_FirstCallEmitsModeAndReporting(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(),
+		[]board.AnalogReaderConfig{{Name: "x", Pin: "A0"}})
+	defer tb.cleanup()
+
+	a, err := tb.b.AnalogByName("x")
+	if err != nil {
+		t.Fatalf("AnalogByName: %v", err)
+	}
+
+	val, err := a.Read(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if val.Value != 0 || val.Min != 0 || val.Max != 1023 {
+		t.Errorf("first Read = %+v, want value=0 min=0 max=1023", val)
+	}
+
+	want := []byte{
+		0xF4, 14, 0x02, // SET_PIN_MODE(14, ANALOG)
+		0xC0, 0x01, // REPORT_ANALOG(0, on)
+	}
+	if got := tb.sentBuf.Bytes(); !bytes.Equal(got, want) {
+		t.Fatalf("wire bytes:\n got = % X\nwant = % X", got, want)
+	}
+
+	// Inject ANALOG_MESSAGE channel 0, value 512.
+	if _, err := tb.arduinoW.Write([]byte{0xE0, 0x00, 0x04}); err != nil {
+		t.Fatalf("inject frame: %v", err)
+	}
+
+	// Poll for cached value.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		v, _ := a.Read(context.Background(), nil)
+		if v.Value == 512 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	val, _ = a.Read(context.Background(), nil)
+	if val.Value != 512 {
+		t.Fatalf("Read after frame = %d, want 512", val.Value)
+	}
+
+	// A second Read after enableOnce must not re-emit SET_PIN_MODE/REPORT_ANALOG.
+	if got := tb.sentBuf.Len(); got != len(want) {
+		t.Errorf("extra bytes after subsequent Read: got %d, want %d", got, len(want))
+	}
+}
+
+func TestAnalogRead_UnknownName(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(), nil)
+	defer tb.cleanup()
+	if _, err := tb.b.AnalogByName("nope"); err == nil {
+		t.Errorf("AnalogByName(nope): want error")
+	}
+}
+
+func TestAnalogWrite_OnAnalogReaderReturnsUnimplemented(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(),
+		[]board.AnalogReaderConfig{{Name: "x", Pin: "A0"}})
+	defer tb.cleanup()
+	a, _ := tb.b.AnalogByName("x")
+	if err := a.Write(context.Background(), 100, nil); !errors.Is(err, errUnimplemented) {
+		t.Errorf("Write: want errUnimplemented, got %v", err)
+	}
+}
+
+func TestGPIOPin_Set_RejectedWhenOwnedByAnalog(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(),
+		[]board.AnalogReaderConfig{{Name: "joy", Pin: "A0"}})
+	defer tb.cleanup()
+
+	pin, err := tb.b.GPIOPinByName("14") // A0 == digital 14
+	if err != nil {
+		t.Fatalf("GPIOPinByName: %v", err)
+	}
+	err = pin.Set(context.Background(), true, nil)
+	if err == nil {
+		t.Fatal("Set on owned pin: want error, got nil")
+	}
+	if got := tb.sentBuf.Len(); got != 0 {
+		t.Errorf("Set on owned pin emitted %d bytes; want zero-IO refusal", got)
+	}
+}
+
+func TestGPIOPin_Get_RejectedWhenOwnedByAnalog(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(),
+		[]board.AnalogReaderConfig{{Name: "joy", Pin: "A0"}})
+	defer tb.cleanup()
+
+	pin, _ := tb.b.GPIOPinByName("14")
+	if _, err := pin.Get(context.Background(), nil); err == nil {
+		t.Fatal("Get on owned pin: want error, got nil")
+	}
+	if got := tb.sentBuf.Len(); got != 0 {
+		t.Errorf("Get on owned pin emitted %d bytes; want zero-IO refusal", got)
+	}
+}
+
+func TestGPIOPin_Set_UnaffectedWhenAnotherPinIsOwned(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(),
+		[]board.AnalogReaderConfig{{Name: "joy", Pin: "A0"}})
+	defer tb.cleanup()
+
+	pin, _ := tb.b.GPIOPinByName("13")
+	if err := pin.Set(context.Background(), true, nil); err != nil {
+		t.Fatalf("Set on unowned pin: %v", err)
+	}
+}
+
+func TestSetPWM_OnPWMCapablePin_EmitsModeAndAnalogMessage(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(), nil)
+	defer tb.cleanup()
+
+	pin, err := tb.b.GPIOPinByName("9") // PWM-capable on Uno
+	if err != nil {
+		t.Fatalf("GPIOPinByName: %v", err)
+	}
+	if err := pin.SetPWM(context.Background(), 0.5, nil); err != nil {
+		t.Fatalf("SetPWM: %v", err)
+	}
+
+	// SET_PIN_MODE(9, PWM=0x03) + ANALOG_MESSAGE channel 9, value 127.
+	// 0.5 * 255 = 127.5 -> 127 after uint16 truncation.
+	want := []byte{
+		0xF4, 0x09, 0x03,
+		0xE9, 0x7F, 0x00,
+	}
+	if got := tb.sentBuf.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+
+	// PWM() returns the cached duty.
+	got, err := pin.PWM(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("PWM: %v", err)
+	}
+	if got != 0.5 {
+		t.Errorf("PWM cached = %v, want 0.5", got)
+	}
+}
+
+func TestSetPWM_OnNonPWMPin_RejectsWithoutWire(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(), nil)
+	defer tb.cleanup()
+
+	pin, _ := tb.b.GPIOPinByName("2") // NOT PWM-capable on Uno
+	err := pin.SetPWM(context.Background(), 0.5, nil)
+	if err == nil {
+		t.Fatal("SetPWM on non-PWM pin: want error, got nil")
+	}
+	if got := tb.sentBuf.Len(); got != 0 {
+		t.Errorf("emitted %d bytes; want zero", got)
+	}
+}
+
+func TestSetPWM_HighPin_EmitsExtendedAnalog(t *testing.T) {
+	// Synthetic ESP32-shape capability: pin 20 is PWM-capable.
+	caps := firmata.CapabilityResponse{Pins: make([]firmata.PinCapabilities, 32)}
+	caps.Pins[20] = firmata.PinCapabilities{
+		firmata.PinModeOutput: 1,
+		firmata.PinModePWM:    8,
+	}
+	amap := firmata.AnalogMappingResponse{ChannelByPin: make([]uint8, 32)}
+	for i := range amap.ChannelByPin {
+		amap.ChannelByPin[i] = 0x7F
+	}
+
+	tb := newTestBoardWithCaps(t, caps, amap, nil)
+	defer tb.cleanup()
+
+	pin, _ := tb.b.GPIOPinByName("20")
+	if err := pin.SetPWM(context.Background(), 0.5, nil); err != nil {
+		t.Fatalf("SetPWM: %v", err)
+	}
+
+	// SET_PIN_MODE(20, PWM) + EXTENDED_ANALOG sysex.
+	want := []byte{
+		0xF4, 20, 0x03,
+		0xF0, 0x6F, 20, 0x7F, 0x00, 0xF7, // value 127 = 0x7F lsb, 0x00 msb
+	}
+	if got := tb.sentBuf.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+}
+
+func TestPWM_DefaultsToZero(t *testing.T) {
+	tb := newTestBoardWithCaps(t, unoCaps(), unoAnalogMap(), nil)
+	defer tb.cleanup()
+
+	pin, _ := tb.b.GPIOPinByName("9")
+	got, err := pin.PWM(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("PWM: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("PWM before any SetPWM = %v, want 0", got)
 	}
 }
 
@@ -271,5 +680,154 @@ func TestSet_AfterStreamClose_ReturnsError(t *testing.T) {
 	}
 	if lastErr == nil {
 		t.Fatalf("expected an error after stream close, got nil")
+	}
+}
+
+// newConstructorTestBoard builds a *firmataBoard via the same code path
+// production NewBoard uses for post-handshake setup (initializeAnalogs),
+// without going through serial.Open / DTR. The fake firmware writes a
+// canonical handshake + capability + analog-mapping reply.
+//
+// Returns the board, the arduino-side writer (for further frame injection),
+// and a syncBuf capturing every byte the board has written. syncBuf is used
+// because QueryCapabilities/QueryAnalogMapping fire write goroutines that race
+// against the test goroutine reading sentBuf.
+func newConstructorTestBoard(
+	t *testing.T,
+	cfg *Config,
+	caps firmata.CapabilityResponse,
+	amap firmata.AnalogMappingResponse,
+) (*firmataBoard, io.WriteCloser, *syncBuf) {
+	t.Helper()
+
+	arduinoR, arduinoW := io.Pipe()
+	sentBuf := &syncBuf{}
+	rw := &rwFake{r: arduinoR, w: sentBuf}
+	c := firmata.New(rw)
+
+	go func() {
+		_, _ = arduinoW.Write([]byte{0xF9, 0x02, 0x05}) // REPORT_VERSION 2.5
+		_, _ = arduinoW.Write(encodeCapabilityResponseForTest(caps))
+		_, _ = arduinoW.Write(encodeAnalogMappingResponseForTest(amap))
+	}()
+
+	hsCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := c.Handshake(hsCtx); err != nil {
+		t.Fatalf("Handshake: %v", err)
+	}
+
+	name := board.Named("test")
+	b := newBoardFromClient(name, c, rw, logging.NewTestLogger(t))
+	if err := b.initializeAnalogs(hsCtx, cfg); err != nil {
+		t.Fatalf("initializeAnalogs: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = arduinoW.Close()
+		_ = b.Close(context.Background())
+	})
+
+	return b, arduinoW, sentBuf
+}
+
+// encodeCapabilityResponseForTest re-serializes a CapabilityResponse to its
+// Firmata wire form. Used only by tests to feed a fake firmware reply.
+func encodeCapabilityResponseForTest(cr firmata.CapabilityResponse) []byte {
+	out := []byte{0xF0, 0x6C}
+	for _, p := range cr.Pins {
+		modes := make([]firmata.PinMode, 0, len(p))
+		for m := range p {
+			modes = append(modes, m)
+		}
+		sort.Slice(modes, func(i, j int) bool { return modes[i] < modes[j] })
+		for _, m := range modes {
+			out = append(out, uint8(m), p[m])
+		}
+		out = append(out, 0x7F)
+	}
+	out = append(out, 0xF7)
+	return out
+}
+
+func encodeAnalogMappingResponseForTest(am firmata.AnalogMappingResponse) []byte {
+	out := []byte{0xF0, 0x6A}
+	out = append(out, am.ChannelByPin...)
+	out = append(out, 0xF7)
+	return out
+}
+
+func encodeSamplingIntervalForTest(ms uint16) []byte {
+	return []byte{0xF0, 0x7A, uint8(ms & 0x7F), uint8((ms >> 7) & 0x7F), 0xF7}
+}
+
+func TestConstructor_EmitsSamplingIntervalWhenConfigured(t *testing.T) {
+	cfg := &Config{
+		SerialPath:         "/dev/null", // unused (we bypass serial.Open)
+		SamplingIntervalMs: 50,
+	}
+	_, _, sentBuf := newConstructorTestBoard(t, cfg, unoCaps(), unoAnalogMap())
+
+	want := encodeSamplingIntervalForTest(50)
+	if !bytes.Contains(sentBuf.Bytes(), want) {
+		t.Errorf("expected SAMPLING_INTERVAL frame % X in % X", want, sentBuf.Bytes())
+	}
+}
+
+func TestConstructor_BuildsAnalogReaders(t *testing.T) {
+	cfg := &Config{
+		SerialPath: "/dev/null",
+		Analogs:    []board.AnalogReaderConfig{{Name: "x", Pin: "A0"}},
+	}
+	b, _, _ := newConstructorTestBoard(t, cfg, unoCaps(), unoAnalogMap())
+
+	a, err := b.AnalogByName("x")
+	if err != nil {
+		t.Fatalf("AnalogByName: %v", err)
+	}
+	if a == nil {
+		t.Fatal("AnalogByName returned nil analog")
+	}
+}
+
+// TestInitializeAnalogs_RejectsNonAnalogPin asserts the seam itself
+// surfaces a structured error when a declared analog targets a pin without
+// analog capability — exercising the same code path NewBoard uses.
+func TestInitializeAnalogs_RejectsNonAnalogPin(t *testing.T) {
+	caps := firmata.CapabilityResponse{Pins: make([]firmata.PinCapabilities, 4)}
+	caps.Pins[2] = firmata.PinCapabilities{firmata.PinModeOutput: 1}
+	amap := firmata.AnalogMappingResponse{ChannelByPin: []uint8{0x7F, 0x7F, 0x7F, 0x7F}}
+
+	arduinoR, arduinoW := io.Pipe()
+	sentBuf := &syncBuf{}
+	rw := &rwFake{r: arduinoR, w: sentBuf}
+	c := firmata.New(rw)
+
+	go func() {
+		_, _ = arduinoW.Write([]byte{0xF9, 0x02, 0x05})
+		_, _ = arduinoW.Write(encodeCapabilityResponseForTest(caps))
+		_, _ = arduinoW.Write(encodeAnalogMappingResponseForTest(amap))
+	}()
+
+	hsCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := c.Handshake(hsCtx); err != nil {
+		t.Fatalf("Handshake: %v", err)
+	}
+
+	b := newBoardFromClient(board.Named("rej"), c, rw, logging.NewTestLogger(t))
+	// Close arduinoW before b.Close so the readLoop sees EOF and exits cleanly.
+	t.Cleanup(func() {
+		_ = arduinoW.Close()
+		_ = b.Close(context.Background())
+	})
+
+	cfg := &Config{
+		SerialPath: "/dev/null",
+		Analogs:    []board.AnalogReaderConfig{{Name: "bad", Pin: "2"}},
+	}
+	err := b.initializeAnalogs(hsCtx, cfg)
+	if err == nil {
+		t.Fatal("expected error rejecting non-analog pin, got nil")
 	}
 }

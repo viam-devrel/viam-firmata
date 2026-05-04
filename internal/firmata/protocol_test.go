@@ -157,3 +157,198 @@ func TestDecode_SysexOverflowErrors(t *testing.T) {
 		t.Fatal("expected error for unbounded sysex, got nil")
 	}
 }
+
+func TestEncodeAnalogWrite(t *testing.T) {
+	// ANALOG_MESSAGE for channel 6, value 200:
+	//   cmd = 0xE0 | 6 = 0xE6
+	//   lsb = 200 & 0x7F = 0x48
+	//   msb = (200 >> 7) & 0x7F = 0x01
+	got := encodeAnalogWrite(6, 200)
+	want := []byte{0xE6, 0x48, 0x01}
+	if !bytes.Equal(got, want) {
+		t.Errorf("encodeAnalogWrite(6, 200): got % X, want % X", got, want)
+	}
+}
+
+func TestEncodeExtendedAnalog(t *testing.T) {
+	// EXTENDED_ANALOG for pin 20, value 200:
+	//   0xF0 0x6F pin lsb msb 0xF7
+	got := encodeExtendedAnalog(20, 200)
+	want := []byte{0xF0, 0x6F, 20, 0x48, 0x01, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("encodeExtendedAnalog(20, 200): got % X, want % X", got, want)
+	}
+}
+
+func TestEncodeExtendedAnalog_HighResolution(t *testing.T) {
+	// 14-bit value 0x3FFF should serialize to two 7-bit bytes 0x7F, 0x7F.
+	got := encodeExtendedAnalog(20, 0x3FFF)
+	want := []byte{0xF0, 0x6F, 20, 0x7F, 0x7F, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("encodeExtendedAnalog(20, 0x3FFF): got % X, want % X", got, want)
+	}
+}
+
+func TestEncodeReportAnalog(t *testing.T) {
+	tests := []struct {
+		name string
+		got  []byte
+		want []byte
+	}{
+		{"channel 0 enable", encodeReportAnalog(0, true), []byte{0xC0, 0x01}},
+		{"channel 5 enable", encodeReportAnalog(5, true), []byte{0xC5, 0x01}},
+		{"channel 0 disable", encodeReportAnalog(0, false), []byte{0xC0, 0x00}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !bytes.Equal(tc.got, tc.want) {
+				t.Errorf("got % X, want % X", tc.got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEncodeSamplingInterval(t *testing.T) {
+	// 100ms -> lsb=0x64, msb=0x00. Frame: F0 7A 64 00 F7.
+	got := encodeSamplingInterval(100)
+	want := []byte{0xF0, 0x7A, 0x64, 0x00, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("encodeSamplingInterval(100): got % X, want % X", got, want)
+	}
+
+	// 1000ms -> 0x03E8. lsb=0x68, msb=0x07.
+	got = encodeSamplingInterval(1000)
+	want = []byte{0xF0, 0x7A, 0x68, 0x07, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("encodeSamplingInterval(1000): got % X, want % X", got, want)
+	}
+}
+
+func TestEncodeCapabilityQuery(t *testing.T) {
+	got := encodeCapabilityQuery()
+	want := []byte{0xF0, 0x6B, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+}
+
+func TestEncodeAnalogMappingQuery(t *testing.T) {
+	got := encodeAnalogMappingQuery()
+	want := []byte{0xF0, 0x69, 0xF7}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got % X, want % X", got, want)
+	}
+}
+
+func TestDecode_AnalogMessage(t *testing.T) {
+	// ANALOG_MESSAGE channel 0, value 512: 0xE0 0x00 0x04
+	r := bufio.NewReader(bytes.NewReader([]byte{0xE0, 0x00, 0x04}))
+	msg, err := decode(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	a, ok := msg.(AnalogMessage)
+	if !ok {
+		t.Fatalf("wanted AnalogMessage, got %T", msg)
+	}
+	if a.Channel != 0 || a.Value != 512 {
+		t.Errorf("got channel=%d value=%d, want channel=0 value=512", a.Channel, a.Value)
+	}
+}
+
+func TestDecode_AnalogMessage_HighChannel(t *testing.T) {
+	// ANALOG_MESSAGE channel 7, value 1023: 0xE7 0x7F 0x07
+	r := bufio.NewReader(bytes.NewReader([]byte{0xE7, 0x7F, 0x07}))
+	msg, err := decode(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	a := msg.(AnalogMessage)
+	if a.Channel != 7 || a.Value != 1023 {
+		t.Errorf("got channel=%d value=%d, want channel=7 value=1023", a.Channel, a.Value)
+	}
+}
+
+func TestDecode_CapabilityResponse(t *testing.T) {
+	// Two pins worth of payload:
+	//   pin 0: INPUT (res 1), OUTPUT (res 1), terminator 0x7F
+	//   pin 1: PWM (res 8), terminator 0x7F
+	frame := []byte{
+		0xF0, 0x6C,
+		0x00, 0x01, // INPUT, 1 bit
+		0x01, 0x01, // OUTPUT, 1 bit
+		0x7F,
+		0x03, 0x08, // PWM, 8 bits
+		0x7F,
+		0xF7,
+	}
+	msg, err := decode(bufio.NewReader(bytes.NewReader(frame)))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	cr, ok := msg.(CapabilityResponse)
+	if !ok {
+		t.Fatalf("wanted CapabilityResponse, got %T", msg)
+	}
+	if len(cr.Pins) != 2 {
+		t.Fatalf("len(Pins) = %d, want 2", len(cr.Pins))
+	}
+	if cr.Pins[0][PinModeInput] != 1 || cr.Pins[0][PinModeOutput] != 1 {
+		t.Errorf("pin 0 caps = %v", cr.Pins[0])
+	}
+	if cr.Pins[1][PinModePWM] != 8 {
+		t.Errorf("pin 1 caps = %v", cr.Pins[1])
+	}
+}
+
+func TestDecode_AnalogMappingResponse(t *testing.T) {
+	// 4-pin map: pin 0 -> not analog (0x7F), pin 1 -> not analog,
+	//            pin 2 -> ch 0, pin 3 -> ch 1
+	frame := []byte{0xF0, 0x6A, 0x7F, 0x7F, 0x00, 0x01, 0xF7}
+	msg, err := decode(bufio.NewReader(bytes.NewReader(frame)))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	am, ok := msg.(AnalogMappingResponse)
+	if !ok {
+		t.Fatalf("wanted AnalogMappingResponse, got %T", msg)
+	}
+	want := []uint8{0x7F, 0x7F, 0x00, 0x01}
+	if !bytes.Equal(am.ChannelByPin, want) {
+		t.Errorf("got % X, want % X", am.ChannelByPin, want)
+	}
+}
+
+func TestDecode_UnknownSysexStillFallsThrough(t *testing.T) {
+	// REPORT_FIRMWARE-ish sysex (0x79) is not in our switch — must remain UnknownMessage.
+	frame := []byte{0xF0, 0x79, 0x02, 0x05, 0xF7}
+	msg, err := decode(bufio.NewReader(bytes.NewReader(frame)))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := msg.(UnknownMessage); !ok {
+		t.Fatalf("wanted UnknownMessage, got %T", msg)
+	}
+}
+
+func TestNewMessageTypes_ZeroValues(t *testing.T) {
+	var am AnalogMessage
+	if am.Channel != 0 || am.Value != 0 {
+		t.Errorf("AnalogMessage zero value: %+v", am)
+	}
+
+	var cr CapabilityResponse
+	if cr.Pins != nil {
+		t.Errorf("CapabilityResponse.Pins zero value: %v", cr.Pins)
+	}
+
+	var ar AnalogMappingResponse
+	if ar.ChannelByPin != nil {
+		t.Errorf("AnalogMappingResponse.ChannelByPin zero value: %v", ar.ChannelByPin)
+	}
+
+	// Ensure they all satisfy the Message interface (compile-time check via assertion).
+	var _ Message = AnalogMessage{}
+	var _ Message = CapabilityResponse{}
+	var _ Message = AnalogMappingResponse{}
+}
