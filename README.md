@@ -95,7 +95,7 @@ The following attributes are available for the board component:
 | `handshake_timeout`     | duration | Optional     | How long to wait for the Firmata `REPORT_VERSION` reply before giving up. Default is `5s`.                                                                                                                   |
 | `sampling_interval_ms`  | int      | Optional     | Global firmware-side analog sampling interval in milliseconds (1..16383). When unset, the firmware default applies (typically 19ms on AVR). Applies to *all* enabled analog reports — Firmata has no per-pin rate. |
 | `analogs`               | array    | Optional     | List of analog reader declarations — see [Analog readers](#analog-readers) below. Each entry has `name` (used by `AnalogByName`) and `pin` (`"A0"`-style or a raw digital-pin number).                         |
-| `enable_diagnostics`    | bool     | Optional     | When true, emits firmware capability dumps, per-pin state probes after `SetPWM`/first analog `Read`, and forwards firmware `STRING_DATA` warnings — all at Debug level. Off by default.                          |
+| `enable_diagnostics`    | bool     | Optional     | When true, emits firmware capability dumps and per-pin state probes after `SetPWM`/first analog `Read` at Debug level, and forwards firmware `STRING_DATA` messages at Warn level. Off by default.                |
 
 ### Analog readers
 
