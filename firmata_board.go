@@ -126,6 +126,10 @@ type firmataBoard struct {
 	// tests using newBoardFromClient leave it off so they don't have to
 	// mock PIN_STATE_RESPONSE or run the diagnostics drain.
 	diagnostics bool
+
+	// diagDone is closed by drainDiagnostics on exit. Only initialized
+	// (and only waited on by Close) when diagnostics is true.
+	diagDone chan struct{}
 }
 
 // newBoardFromClient wires a *firmata.Client (and the io.Closer that owns the
@@ -152,7 +156,9 @@ func newBoardFromClient(name resource.Name, c *firmata.Client, closer io.Closer,
 // otherwise-unrecognized frames into the viam logger. ConfigurableFirmata
 // uses STRING_DATA for warnings (e.g. "PIN x IS NOT SUPPORTED FOR MODE y") so
 // these are gold for figuring out why a SetPinMode appears to no-op.
+// Closes b.diagDone on exit so Close() can wait for it.
 func (b *firmataBoard) drainDiagnostics() {
+	defer close(b.diagDone)
 	for s := range b.client.Diagnostics() {
 		b.logger.Warnf("firmata board: firmware diag: %s", s)
 	}
@@ -168,11 +174,14 @@ func (b *firmataBoard) drainEvents() {
 }
 
 // Close tears down the client and the underlying transport and waits for the
-// drain goroutine to exit. Idempotent.
+// drain goroutines to exit. Idempotent.
 func (b *firmataBoard) Close(_ context.Context) error {
 	b.closeOnce.Do(func() {
-		b.closeErr = b.client.Close() // unblocks reader → closes events → drain exits
+		b.closeErr = b.client.Close() // unblocks reader → closes events/diagnostics → drains exit
 		<-b.drainDone
+		if b.diagnostics {
+			<-b.diagDone
+		}
 		if cerr := b.closer.Close(); b.closeErr == nil {
 			b.closeErr = cerr
 		}
@@ -288,12 +297,14 @@ func (p *firmataGPIOPin) PWM(_ context.Context, _ map[string]any) (float64, erro
 	return p.board.pwmDuty[p.pin], nil
 }
 
-// PWMFreq is intentionally unimplemented in v1; PWM support is out of scope.
+// PWMFreq is intentionally unimplemented; the Firmata wire protocol has no
+// spec for runtime per-pin frequency control.
 func (p *firmataGPIOPin) PWMFreq(_ context.Context, _ map[string]any) (uint, error) {
 	return 0, errUnimplemented
 }
 
-// SetPWMFreq is intentionally unimplemented in v1; PWM support is out of scope.
+// SetPWMFreq is intentionally unimplemented; the Firmata wire protocol has no
+// spec for runtime per-pin frequency control.
 func (p *firmataGPIOPin) SetPWMFreq(_ context.Context, _ uint, _ map[string]any) error {
 	return errUnimplemented
 }
@@ -360,9 +371,10 @@ func NewBoard(ctx context.Context, _ resource.Dependencies, conf resource.Config
 	b := newBoardFromClient(conf.ResourceName(), c, sp, logger)
 	b.diagnostics = cfg.EnableDiagnostics
 	if b.diagnostics {
+		b.diagDone = make(chan struct{})
 		go b.drainDiagnostics()
 	}
-	if err := b.initializeAnalogs(hsCtx, cfg, logger); err != nil {
+	if err := b.initializeAnalogs(hsCtx, cfg); err != nil {
 		_ = b.Close(ctx)
 		return nil, fmt.Errorf("init on %s: %w", cfg.SerialPath, err)
 	}
@@ -478,7 +490,7 @@ func (a *firmataAnalog) Write(_ context.Context, _ int, _ map[string]any) error 
 // is responsible for calling Close(). This is the single source of truth
 // for the analog initialization sequence: NewBoard and the test harness
 // both call it so a single edit point gates both production and tests.
-func (b *firmataBoard) initializeAnalogs(ctx context.Context, cfg *Config, logger logging.Logger) error {
+func (b *firmataBoard) initializeAnalogs(ctx context.Context, cfg *Config) error {
 	caps, err := b.client.QueryCapabilities(ctx)
 	if err != nil {
 		return fmt.Errorf("capability query: %w", err)
@@ -498,7 +510,7 @@ func (b *firmataBoard) initializeAnalogs(ctx context.Context, cfg *Config, logge
 	b.analogMap = amap
 
 	if b.diagnostics {
-		logCapabilities(logger, caps, amap)
+		logCapabilities(b.logger, caps, amap)
 	}
 
 	for _, ac := range cfg.Analogs {
@@ -514,14 +526,14 @@ func (b *firmataBoard) initializeAnalogs(ctx context.Context, cfg *Config, logge
 			return fmt.Errorf("analog %q: pin %d does not support analog mode", ac.Name, dpin)
 		}
 		if ac.SamplesPerSecond != 0 {
-			logger.Warnf("firmata board: analog %q samples_per_sec=%d ignored — Firmata only supports a global sampling_interval_ms",
+			b.logger.Warnf("firmata board: analog %q samples_per_sec=%d ignored — Firmata only supports a global sampling_interval_ms",
 				ac.Name, ac.SamplesPerSecond)
 		}
 		b.analogs[ac.Name] = &firmataAnalog{
 			board: b, name: ac.Name, digitalPin: dpin, channel: uint8(ch),
 		}
 		b.ownedPins[dpin] = ac.Name
-		logger.Debugf("firmata board: analog %q resolved to digital pin %d, channel %d",
+		b.logger.Debugf("firmata board: analog %q resolved to digital pin %d, channel %d",
 			ac.Name, dpin, ch)
 	}
 

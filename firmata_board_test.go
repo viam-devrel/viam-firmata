@@ -719,7 +719,7 @@ func newConstructorTestBoard(
 
 	name := board.Named("test")
 	b := newBoardFromClient(name, c, rw, logging.NewTestLogger(t))
-	if err := b.initializeAnalogs(hsCtx, cfg, logging.NewTestLogger(t)); err != nil {
+	if err := b.initializeAnalogs(hsCtx, cfg); err != nil {
 		t.Fatalf("initializeAnalogs: %v", err)
 	}
 
@@ -826,7 +826,7 @@ func TestInitializeAnalogs_RejectsNonAnalogPin(t *testing.T) {
 		SerialPath: "/dev/null",
 		Analogs:    []board.AnalogReaderConfig{{Name: "bad", Pin: "2"}},
 	}
-	err := b.initializeAnalogs(hsCtx, cfg, logging.NewTestLogger(t))
+	err := b.initializeAnalogs(hsCtx, cfg)
 	if err == nil {
 		t.Fatal("expected error rejecting non-analog pin, got nil")
 	}
